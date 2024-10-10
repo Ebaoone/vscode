@@ -32,7 +32,7 @@ export interface MarkedOptions extends marked.MarkedOptions {
 
 export interface MarkdownRenderOptions extends FormattedTextRenderOptions {
 	readonly codeBlockRenderer?: (languageId: string, value: string) => Promise<HTMLElement>;
-	readonly codeBlockRendererSync?: (languageId: string, value: string) => HTMLElement;
+	readonly codeBlockRendererSync?: (languageId: string, value: string, raw?: string) => HTMLElement;
 	readonly asyncRenderCallback?: () => void;
 	readonly fillInIncompleteTokens?: boolean;
 	readonly remoteImageIsAllowed?: (uri: URI) => boolean;
@@ -163,9 +163,9 @@ export function renderMarkdown(markdown: IMarkdownString, options: MarkdownRende
 	const syncCodeBlocks: [string, HTMLElement][] = [];
 
 	if (options.codeBlockRendererSync) {
-		renderer.code = ({ text, lang }: marked.Tokens.Code) => {
+		renderer.code = ({ text, lang, raw }: marked.Tokens.Code) => {
 			const id = defaultGenerator.nextId();
-			const value = options.codeBlockRendererSync!(postProcessCodeBlockLanguageId(lang), text);
+			const value = options.codeBlockRendererSync!(postProcessCodeBlockLanguageId(lang), text, raw);
 			syncCodeBlocks.push([id, value]);
 			return `<div class="code" data-code="${id}">${escape(text)}</div>`;
 		};
@@ -545,9 +545,8 @@ export function renderMarkdownAsPlaintext(markdown: IMarkdownString, withCodeBlo
 		value = `${value.substr(0, 100_000)}…`;
 	}
 
-	const html = marked.parse(value, { async: false, renderer: withCodeBlocks ? plainTextWithCodeBlocksRenderer.value : plainTextRenderer.value }).replace(/&(#\d+|[a-zA-Z]+);/g, m => unescapeInfo.get(m) ?? m);
-
-	return sanitizeRenderedMarkdown({ isTrusted: false }, html).toString();
+	const html = marked.parse(value, { async: false, renderer: withCodeBlocks ? plainTextWithCodeBlocksRenderer.value : plainTextRenderer.value });
+	return sanitizeRenderedMarkdown({ isTrusted: false }, html).toString().replace(/&(#\d+|[a-zA-Z]+);/g, m => unescapeInfo.get(m) ?? m);
 }
 
 const unescapeInfo = new Map<string, string>([

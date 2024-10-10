@@ -12,13 +12,16 @@ declare module 'vscode' {
 	}
 
 	export interface ConversationRequest {
+		// eslint-disable-next-line local/vscode-dts-string-type-literals
 		readonly type: 'request';
 		readonly message: string;
 	}
 
 	export interface ConversationResponse {
+		// eslint-disable-next-line local/vscode-dts-string-type-literals
 		readonly type: 'response';
 		readonly message: string;
+		readonly result?: ChatResult;
 		readonly references?: DocumentContextItem[];
 	}
 
@@ -52,7 +55,33 @@ declare module 'vscode' {
 		): ProviderResult<WorkspaceEdit | null>;
 	}
 
+	export interface MappedEditsRequest {
+		readonly codeBlocks: { code: string; resource: Uri; markdownBeforeBlock?: string }[];
+		readonly conversation: (ConversationRequest | ConversationResponse)[]; // for every prior response that contains codeblocks, make sure we pass the code as well as the resources based on the reported codemapper URIs
+	}
+
+	export interface MappedEditsResponseStream {
+		textEdit(target: Uri, edits: TextEdit | TextEdit[]): void;
+	}
+
+	export interface MappedEditsResult {
+		readonly errorMessage?: string;
+	}
+
+	/**
+	 * Interface for providing mapped edits for a given document.
+	 */
+	export interface MappedEditsProvider2 {
+		provideMappedEdits(
+			request: MappedEditsRequest,
+			result: MappedEditsResponseStream,
+			token: CancellationToken
+		): ProviderResult<MappedEditsResult>;
+	}
+
 	namespace chat {
 		export function registerMappedEditsProvider(documentSelector: DocumentSelector, provider: MappedEditsProvider): Disposable;
+
+		export function registerMappedEditsProvider2(provider: MappedEditsProvider2): Disposable;
 	}
 }
