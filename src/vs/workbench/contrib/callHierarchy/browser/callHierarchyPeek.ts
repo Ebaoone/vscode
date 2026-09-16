@@ -26,14 +26,13 @@ import { toDisposable, DisposableStore } from '../../../../base/common/lifecycle
 import { TrackedRangeStickiness, IModelDeltaDecoration, IModelDecorationOptions, OverviewRulerLane } from '../../../../editor/common/model.js';
 import { themeColorFromId, IThemeService, IColorTheme } from '../../../../platform/theme/common/themeService.js';
 import { IPosition } from '../../../../editor/common/core/position.js';
-import { IAction } from '../../../../base/common/actions.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
 import { Color } from '../../../../base/common/color.js';
 import { TreeMouseEventTarget, ITreeNode } from '../../../../base/browser/ui/tree/tree.js';
 import { URI } from '../../../../base/common/uri.js';
 import { MenuId, IMenuService } from '../../../../platform/actions/common/actions.js';
 import { IContextKeyService } from '../../../../platform/contextkey/common/contextkey.js';
-import { createAndFillInActionBarActions } from '../../../../platform/actions/browser/menuEntryActionViewItem.js';
+import { getFlatActionBarActions } from '../../../../platform/actions/browser/menuEntryActionViewItem.js';
 
 const enum State {
 	Loading = 'loading',
@@ -129,8 +128,7 @@ export class CallHierarchyTreePeekWidget extends peekView.PeekViewWidget {
 
 		const menu = this._menuService.createMenu(CallHierarchyTreePeekWidget.TitleMenu, this._contextKeyService);
 		const updateToolbar = () => {
-			const actions: IAction[] = [];
-			createAndFillInActionBarActions(menu, undefined, actions);
+			const actions = getFlatActionBarActions(menu.getActions());
 			this._actionbarWidget!.clear();
 			this._actionbarWidget!.push(actions, { label: false, icon: true });
 		};
@@ -348,13 +346,13 @@ export class CallHierarchyTreePeekWidget extends peekView.PeekViewWidget {
 	}
 
 	showLoading(): void {
-		this._parent.dataset['state'] = State.Loading;
+		this._parent.dataset.state = State.Loading;
 		this.setTitle(localize('title.loading', "Loading..."));
 		this._show();
 	}
 
 	showMessage(message: string): void {
-		this._parent.dataset['state'] = State.Message;
+		this._parent.dataset.state = State.Message;
 		this.setTitle('');
 		this.setMetaTitle('');
 		this._message.innerText = message;
@@ -379,7 +377,7 @@ export class CallHierarchyTreePeekWidget extends peekView.PeekViewWidget {
 				: localize('empt.callsTo', "No callers of '{0}'", model.root.name));
 
 		} else {
-			this._parent.dataset['state'] = State.Data;
+			this._parent.dataset.state = State.Data;
 			if (!viewState || this._tree.getFocus().length === 0) {
 				this._tree.setFocus([root.children[0].element]);
 			}

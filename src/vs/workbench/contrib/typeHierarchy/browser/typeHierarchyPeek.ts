@@ -8,7 +8,6 @@ import { Dimension, isKeyboardEvent } from '../../../../base/browser/dom.js';
 import { Orientation, Sizing, SplitView } from '../../../../base/browser/ui/splitview/splitview.js';
 import { IAsyncDataTreeViewState } from '../../../../base/browser/ui/tree/asyncDataTree.js';
 import { ITreeNode, TreeMouseEventTarget } from '../../../../base/browser/ui/tree/tree.js';
-import { IAction } from '../../../../base/common/actions.js';
 import { Color } from '../../../../base/common/color.js';
 import { Event } from '../../../../base/common/event.js';
 import { FuzzyScore } from '../../../../base/common/filters.js';
@@ -24,7 +23,7 @@ import { IModelDecorationOptions, TrackedRangeStickiness, IModelDeltaDecoration,
 import { ITextModelService } from '../../../../editor/common/services/resolverService.js';
 import * as peekView from '../../../../editor/contrib/peekView/browser/peekView.js';
 import { localize } from '../../../../nls.js';
-import { createAndFillInActionBarActions } from '../../../../platform/actions/browser/menuEntryActionViewItem.js';
+import { getFlatActionBarActions } from '../../../../platform/actions/browser/menuEntryActionViewItem.js';
 import { IMenuService, MenuId } from '../../../../platform/actions/common/actions.js';
 import { IContextKeyService } from '../../../../platform/contextkey/common/contextkey.js';
 import { IInstantiationService } from '../../../../platform/instantiation/common/instantiation.js';
@@ -130,8 +129,7 @@ export class TypeHierarchyTreePeekWidget extends peekView.PeekViewWidget {
 
 		const menu = this._menuService.createMenu(TypeHierarchyTreePeekWidget.TitleMenu, this._contextKeyService);
 		const updateToolbar = () => {
-			const actions: IAction[] = [];
-			createAndFillInActionBarActions(menu, undefined, actions);
+			const actions = getFlatActionBarActions(menu.getActions());
 			this._actionbarWidget!.clear();
 			this._actionbarWidget!.push(actions, { label: false, icon: true });
 		};
@@ -343,13 +341,13 @@ export class TypeHierarchyTreePeekWidget extends peekView.PeekViewWidget {
 	}
 
 	showLoading(): void {
-		this._parent.dataset['state'] = State.Loading;
+		this._parent.dataset.state = State.Loading;
 		this.setTitle(localize('title.loading', "Loading..."));
 		this._show();
 	}
 
 	showMessage(message: string): void {
-		this._parent.dataset['state'] = State.Message;
+		this._parent.dataset.state = State.Message;
 		this.setTitle('');
 		this.setMetaTitle('');
 		this._message.innerText = message;
@@ -373,7 +371,7 @@ export class TypeHierarchyTreePeekWidget extends peekView.PeekViewWidget {
 				: localize('empt.subtypes', "No subtypes of '{0}'", model.root.name));
 
 		} else {
-			this._parent.dataset['state'] = State.Data;
+			this._parent.dataset.state = State.Data;
 			if (!viewState || this._tree.getFocus().length === 0) {
 				this._tree.setFocus([root.children[0].element]);
 			}

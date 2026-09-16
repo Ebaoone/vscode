@@ -17,7 +17,7 @@ import { LanguageAgnosticBracketTokens } from './brackets.js';
 import { Length, lengthAdd, lengthGreaterThanEqual, lengthLessThan, lengthLessThanEqual, lengthsToRange, lengthZero, positionToLength, toLength } from './length.js';
 import { parseDocument } from './parser.js';
 import { DenseKeyProvider } from './smallImmutableSet.js';
-import { FastTokenizer, TextBufferTokenizer } from './tokenizer.js';
+import { FastTokenizer, TextBufferTokenizer, Token, TokenKind } from './tokenizer.js';
 import { BackgroundTokenizationState } from '../../../tokenizationTextModelPart.js';
 import { Position } from '../../../core/position.js';
 import { CallbackIterable } from '../../../../../base/common/arrays.js';
@@ -25,7 +25,7 @@ import { combineTextEditInfos } from './combineTextEditInfos.js';
 import { ClosingBracketKind, OpeningBracketKind } from '../../../languages/supports/languageBracketsConfiguration.js';
 
 export class BracketPairsTree extends Disposable {
-	private readonly didChangeEmitter = new Emitter<void>();
+	private readonly didChangeEmitter;
 
 	/*
 		There are two trees:
@@ -39,22 +39,28 @@ export class BracketPairsTree extends Disposable {
 	private initialAstWithoutTokens: AstNode | undefined;
 	private astWithTokens: AstNode | undefined;
 
-	private readonly denseKeyProvider = new DenseKeyProvider<string>();
-	private readonly brackets = new LanguageAgnosticBracketTokens(this.denseKeyProvider, this.getLanguageConfiguration);
+	private readonly denseKeyProvider;
+	private readonly brackets;
 
 	public didLanguageChange(languageId: string): boolean {
 		return this.brackets.didLanguageChange(languageId);
 	}
 
-	public readonly onDidChange = this.didChangeEmitter.event;
-	private queuedTextEditsForInitialAstWithoutTokens: TextEditInfo[] = [];
-	private queuedTextEdits: TextEditInfo[] = [];
+	public readonly onDidChange;
+	private queuedTextEditsForInitialAstWithoutTokens: TextEditInfo[];
+	private queuedTextEdits: TextEditInfo[];
 
 	public constructor(
 		private readonly textModel: TextModel,
 		private readonly getLanguageConfiguration: (languageId: string) => ResolvedLanguageConfiguration
 	) {
 		super();
+		this.didChangeEmitter = this._register(new Emitter<void>());
+		this.denseKeyProvider = new DenseKeyProvider<string>();
+		this.brackets = new LanguageAgnosticBracketTokens(this.denseKeyProvider, this.getLanguageConfiguration);
+		this.onDidChange = this.didChangeEmitter.event;
+		this.queuedTextEditsForInitialAstWithoutTokens = [];
+		this.queuedTextEdits = [];
 
 		if (!textModel.tokenization.hasTokens) {
 			const brackets = this.brackets.getSingleLanguageBracketTokens(this.textModel.getLanguageId());
@@ -168,6 +174,20 @@ export class BracketPairsTree extends Disposable {
 		});
 	}
 
+	public hasUnmatchedClosingBracketAfter(position: Position, openingBracket: OpeningBracketKind): boolean {
+		// Defer semantic bracket checks until tokenization is accurate for the entire model.
+		if (!this.textModel.tokenization.hasAccurateTokensForLine(this.textModel.getLineCount())) {
+			return false;
+		}
+		this.flushQueue();
+		const openingBracketToken = this.brackets.getToken(openingBracket.bracketText, openingBracket.languageId);
+		if (!openingBracketToken || openingBracketToken.kind !== TokenKind.OpeningBracket) {
+			return false;
+		}
+		const node = this.astWithTokens!;
+		return hasUnmatchedClosingBracketAfter(node, positionToLength(position), openingBracketToken);
+	}
+
 	public getFirstBracketAfter(position: Position): IFoundBracket | null {
 		this.flushQueue();
 
@@ -181,6 +201,38 @@ export class BracketPairsTree extends Disposable {
 		const node = this.initialAstWithoutTokens || this.astWithTokens!;
 		return getFirstBracketBefore(node, lengthZero, node.length, positionToLength(position));
 	}
+}
+
+function hasUnmatchedClosingBracketAfter(root: AstNode, positionLength: Length, openingBracketToken: Token): boolean {
+	const openingBracketIds = openingBracketToken.bracketIds;
+	if (!root.missingOpeningBracketIds.intersects(openingBracketIds)) {
+		return false;
+	}
+	const nodesToVisit: { node: AstNode; offset: Length }[] = [{ node: root, offset: lengthZero }];
+	while (nodesToVisit.length > 0) {
+		const { node, offset } = nodesToVisit.pop()!;
+		// UnexpectedClosingBracket nodes represent globally unmatched closing brackets.
+		if (node.kind === AstNodeKind.UnexpectedClosingBracket) {
+			// Ignore unmatched closers before the cursor because the new opener cannot pair with them.
+			if (lengthGreaterThanEqual(offset, positionLength)) {
+				return true;
+			}
+			continue;
+		}
+		let childOffset = offset;
+		for (const child of node.children) {
+			// child.length is the span of source text represented by that AST child—not its number of descendants
+			const childEndOffset = lengthAdd(childOffset, child.length);
+			const childEndsAfterPosition = lengthGreaterThanEqual(childEndOffset, positionLength);
+			const childCanContainMatchingOrphan = child.missingOpeningBracketIds.intersects(openingBracketIds);
+			// Visit only children that are after the cursor and may contain the matching orphan
+			if (childEndsAfterPosition && childCanContainMatchingOrphan) {
+				nodesToVisit.push({ node: child, offset: childOffset });
+			}
+			childOffset = childEndOffset;
+		}
+	}
+	return false;
 }
 
 function getFirstBracketBefore(node: AstNode, nodeOffsetStart: Length, nodeOffsetEnd: Length, position: Length): IFoundBracket | null {

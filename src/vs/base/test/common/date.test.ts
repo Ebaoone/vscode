@@ -4,11 +4,31 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { strictEqual } from 'assert';
-import { fromNow, fromNowByDay, getDurationString } from '../../common/date.js';
+import { fromNow, fromNowByDay, getDurationString, getExpirationTime, getRemainingTimeInSeconds, isExpired, safeIntl } from '../../common/date.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from './utils.js';
+import { LANGUAGE_DEFAULT } from '../../common/platform.js';
 
 suite('Date', () => {
 	ensureNoDisposablesAreLeakedInTestSuite();
+
+	test('getRemainingTimeInSeconds', () => {
+		strictEqual(getRemainingTimeInSeconds(undefined, 1000), undefined);
+		strictEqual(getRemainingTimeInSeconds(1000, 1000), undefined);
+		strictEqual(getRemainingTimeInSeconds(1001, 1000), 1);
+		strictEqual(getRemainingTimeInSeconds(2001, 1000), 2);
+	});
+
+	test('getExpirationTime', () => {
+		strictEqual(getExpirationTime(undefined, 1000), undefined);
+		strictEqual(getExpirationTime(0, 1000), 1000);
+		strictEqual(getExpirationTime(2, 1000), 3000);
+	});
+
+	test('isExpired', () => {
+		strictEqual(isExpired(undefined, 1000), false);
+		strictEqual(isExpired(1000, 1000), true);
+		strictEqual(isExpired(1001, 1000), false);
+	});
 
 	suite('fromNow', () => {
 		test('appendAgoLabel', () => {
@@ -36,11 +56,13 @@ suite('Date', () => {
 		test('yesterday', () => {
 			const yesterday = new Date();
 			yesterday.setDate(yesterday.getDate() - 1);
+			yesterday.setHours(12);
 			strictEqual(fromNowByDay(yesterday), 'Yesterday');
 		});
 		test('daysAgo', () => {
 			const daysAgo = new Date();
 			daysAgo.setDate(daysAgo.getDate() - 5);
+			daysAgo.setHours(daysAgo.getHours() - 2); // 2 hours further to avoid DST issues
 			strictEqual(fromNowByDay(daysAgo, true), '5 days ago');
 		});
 	});
@@ -67,6 +89,19 @@ suite('Date', () => {
 			strictEqual(getDurationString(1000 * 60 * 60, true), '1 hours');
 			strictEqual(getDurationString(1000 * 60 * 60 * 24 - 1, true), '24 hours');
 			strictEqual(getDurationString(1000 * 60 * 60 * 24, true), '1 days');
+		});
+
+		suite('safeIntl', () => {
+			test('Collator fallback', () => {
+				const collator = safeIntl.Collator('en_IT').value;
+				const comparison = collator.compare('a', 'b');
+				strictEqual(comparison, -1);
+			});
+
+			test('Locale fallback', () => {
+				const locale = safeIntl.Locale('en_IT').value;
+				strictEqual(locale.baseName, LANGUAGE_DEFAULT);
+			});
 		});
 	});
 });

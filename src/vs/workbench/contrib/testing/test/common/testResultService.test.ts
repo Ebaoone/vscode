@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
-import { timeout } from '../../../../../base/common/async.js';
+import { RunOnceScheduler, timeout } from '../../../../../base/common/async.js';
 import { VSBuffer } from '../../../../../base/common/buffer.js';
 import { CancellationTokenSource } from '../../../../../base/common/cancellation.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
@@ -21,6 +21,7 @@ import { ITestTaskState, ResolvedTestRunRequest, TestResultItem, TestResultState
 import { makeEmptyCounts } from '../../common/testingStates.js';
 import { TestTestCollection, getInitializedMainTestCollection, testStubs } from './testStubs.js';
 import { TestStorageService } from '../../../../test/common/workbenchTestServices.js';
+import { upcastPartial } from '../../../../../base/test/common/mock.js';
 
 suite('Workbench - Test Results Service', () => {
 	const getLabelsIn = (it: Iterable<TestResultItem>) => [...it].map(t => t.item.label).sort();
@@ -40,18 +41,27 @@ suite('Workbench - Test Results Service', () => {
 		}]
 	});
 
+	let insertCounter = 0;
+
 	class TestLiveTestResult extends LiveTestResult {
+		public disposed = false;
+
 		constructor(
 			id: string,
 			persist: boolean,
 			request: ResolvedTestRunRequest,
 		) {
-			super(id, persist, request, NullTelemetryService);
+			super(id, persist, request, insertCounter++, NullTelemetryService);
 			ds.add(this);
 		}
 
 		public setAllToStatePublic(state: TestResultState, taskId: string, when: (task: ITestTaskState, item: TestResultItem) => boolean) {
 			this.setAllToState(state, taskId, when);
+		}
+
+		public override dispose(): void {
+			this.disposed = true;
+			super.dispose();
 		}
 	}
 
@@ -191,11 +201,11 @@ suite('Workbench - Test Results Service', () => {
 			r.markComplete();
 
 			const c = makeEmptyCounts();
-			c[TestResultState.Unset] = 3;
+			c[TestResultState.Skipped] = 3;
 			c[TestResultState.Passed] = 1;
 			assert.deepStrictEqual(r.counts, c);
 
-			assert.deepStrictEqual(r.getStateById(tests.root.id)?.ownComputedState, TestResultState.Unset);
+			assert.deepStrictEqual(r.getStateById(tests.root.id)?.ownComputedState, TestResultState.Skipped);
 			assert.deepStrictEqual(r.getStateById(new TestId(['ctrlId', 'id-a', 'id-aa']).toString())?.ownComputedState, TestResultState.Passed);
 		});
 	});
@@ -205,7 +215,7 @@ suite('Workbench - Test Results Service', () => {
 		let results: TestResultService;
 
 		class TestTestResultService extends TestResultService {
-			protected override persistScheduler = { schedule: () => this.persistImmediately() } as any;
+			protected override persistScheduler = upcastPartial<RunOnceScheduler>({ schedule: () => this.persistImmediately() });
 		}
 
 		setup(() => {
@@ -263,19 +273,22 @@ suite('Workbench - Test Results Service', () => {
 				'',
 				false,
 				defaultOpts([]),
+				insertCounter++,
 				NullTelemetryService,
 			));
 			results.clear();
 
 			assert.deepStrictEqual(results.results, [r2]);
+			assert.strictEqual(r.disposed, true);
 		});
 
-		test('keeps ongoing tests on top', async () => {
+		test('keeps ongoing tests on top, restored order when done', async () => {
 			results.push(r);
 			const r2 = results.push(new LiveTestResult(
 				'',
 				false,
 				defaultOpts([]),
+				insertCounter++,
 				NullTelemetryService,
 			));
 
@@ -283,7 +296,7 @@ suite('Workbench - Test Results Service', () => {
 			r2.markComplete();
 			assert.deepStrictEqual(results.results, [r, r2]);
 			r.markComplete();
-			assert.deepStrictEqual(results.results, [r, r2]);
+			assert.deepStrictEqual(results.results, [r2, r]);
 		});
 
 		const makeHydrated = async (completedAt = 42, state = TestResultState.Passed) => new HydratedTestResult({
@@ -325,6 +338,19 @@ suite('Workbench - Test Results Service', () => {
 			const hydrated2 = await makeHydrated(30);
 			results.push(hydrated2);
 			assert.deepStrictEqual(results.results, [r, hydrated1, hydrated2]);
+		});
+
+		test('disposes a completed result that is immediately evicted', async () => {
+			const newerCompletedAt = Date.now() + 1000;
+			for (let i = 0; i < 128; i++) {
+				results.push(await makeHydrated(newerCompletedAt + i));
+			}
+
+			const older = new TestLiveTestResult('older', false, defaultOpts([]));
+			older.markComplete();
+			results.push(older);
+
+			assert.deepStrictEqual({ retained: results.results.includes(older), disposed: older.disposed }, { retained: false, disposed: true });
 		});
 	});
 

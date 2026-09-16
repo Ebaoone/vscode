@@ -44,6 +44,7 @@ suite('formatOptions', () => {
 	test('Text should wrap', () => {
 		assert.deepStrictEqual(
 			formatOptions({
+				// eslint-disable-next-line local/code-no-any-casts
 				'add': o((<any>'bar ').repeat(9))
 			}, 40),
 			[
@@ -55,6 +56,7 @@ suite('formatOptions', () => {
 	test('Text should revert to the condensed view when the terminal is too narrow', () => {
 		assert.deepStrictEqual(
 			formatOptions({
+				// eslint-disable-next-line local/code-no-any-casts
 				'add': o((<any>'bar ').repeat(9))
 			}, 30),
 			[
@@ -105,6 +107,41 @@ suite('parseArgs', () => {
 		assert.deepStrictEqual(errorReporter.result, expectedErrors);
 	}
 
+	test('--no-KEY with boolean no-KEY and string KEY does not trigger empty value error', () => {
+		// Regression test for https://github.com/microsoft/vscode/issues/199664
+		// '--no-proxy-server' should set 'no-proxy-server=true' without triggering
+		// an empty value error for 'proxy-server'
+		interface TestArgs {
+			'no-proxy-server'?: boolean;
+			'proxy-server'?: string;
+			_: string[];
+		}
+		const options = {
+			'no-proxy-server': { type: 'boolean' as const },
+			'proxy-server': { type: 'string' as const },
+			_: { type: 'string[]' as const }
+		} as OptionDescriptions<TestArgs>;
+
+		assertParse(options, ['--no-proxy-server'], { 'no-proxy-server': true, _: [] }, []);
+		assertParse(options, ['--proxy-server=http://proxy.example.com:8080'], { 'no-proxy-server': false, 'proxy-server': 'http://proxy.example.com:8080', _: [] }, []);
+		assertParse(options, ['--no-proxy-server', '--proxy-server=http://proxy.example.com:8080'], { 'no-proxy-server': true, 'proxy-server': 'http://proxy.example.com:8080', _: [] }, []);
+		assertParse(options, [], { 'no-proxy-server': false, _: [] }, []);
+	});
+
+	test('--no-KEY with boolean no-KEY correctly sets the value to true', () => {
+		interface TestArgs {
+			'no-foo'?: boolean;
+			_: string[];
+		}
+		const options = {
+			'no-foo': { type: 'boolean' as const },
+			_: { type: 'string[]' as const }
+		} as OptionDescriptions<TestArgs>;
+
+		assertParse(options, ['--no-foo'], { 'no-foo': true, _: [] }, []);
+		assertParse(options, [], { 'no-foo': false, _: [] }, []);
+	});
+
 	test('subcommands', () => {
 
 		interface TestArgs1 {
@@ -133,6 +170,27 @@ suite('parseArgs', () => {
 			['testcmd', '--testArg=foo', '--testX'],
 			{ testcmd: { testArg: 'foo', '_': [] }, '_': [] },
 			['testcmd-onUnknownOption testX']
+		);
+
+		assertParse(
+			options1,
+			['--testArg=foo', 'testcmd', '--testX'],
+			{ testcmd: { testArg: 'foo', '_': [] }, '_': [] },
+			['testcmd-onUnknownOption testX']
+		);
+
+		assertParse(
+			options1,
+			['--testArg=foo', 'testcmd'],
+			{ testcmd: { testArg: 'foo', '_': [] }, '_': [] },
+			[]
+		);
+
+		assertParse(
+			options1,
+			['--testArg', 'foo', 'testcmd'],
+			{ testcmd: { testArg: 'foo', '_': [] }, '_': [] },
+			[]
 		);
 
 		interface TestArgs2 {

@@ -16,6 +16,7 @@ import * as typeConverters from '../typeConverters';
 import { ClientCapability, ITypeScriptServiceClient, ServerResponse } from '../typescriptService';
 import TypingsStatus from '../ui/typingsStatus';
 import { nulToken } from '../utils/cancellation';
+import { readUnifiedConfig, UnifiedConfigurationScope } from '../utils/configuration';
 import FileConfigurationManager from './fileConfigurationManager';
 import { applyCodeAction } from './util/codeAction';
 import { conditionalRegistration, requireSomeCapability } from './util/dependentRegistration';
@@ -56,7 +57,7 @@ class MyCompletionItem extends vscode.CompletionItem {
 		public readonly document: vscode.TextDocument,
 		public readonly tsEntry: Proto.CompletionEntry,
 		private readonly completionContext: CompletionContext,
-		public readonly metadata: any | undefined,
+		public readonly metadata: unknown | undefined,
 		client: ITypeScriptServiceClient,
 		defaultCommitCharacters: readonly string[] | undefined,
 	) {
@@ -506,8 +507,7 @@ class MyCompletionItem extends vscode.CompletionItem {
 		entry: Proto.CompletionEntry,
 		defaultCommitCharacters: readonly string[] | undefined,
 	): string[] | undefined {
-		// @ts-expect-error until TS 5.6
-		let commitCharacters = (entry.commitCharacters as string[] | undefined) ?? (defaultCommitCharacters ? Array.from(defaultCommitCharacters) : undefined);
+		let commitCharacters = entry.commitCharacters ?? (defaultCommitCharacters ? Array.from(defaultCommitCharacters) : undefined);
 		if (commitCharacters) {
 			if (context.enableCallCompletions
 				&& !context.isNewIdentifierLocation
@@ -667,15 +667,14 @@ namespace CompletionConfiguration {
 
 	export function getConfigurationForResource(
 		modeId: string,
-		resource: vscode.Uri
+		scope: UnifiedConfigurationScope
 	): CompletionConfiguration {
-		const config = vscode.workspace.getConfiguration(modeId, resource);
 		return {
-			completeFunctionCalls: config.get<boolean>(CompletionConfiguration.completeFunctionCalls, false),
-			pathSuggestions: config.get<boolean>(CompletionConfiguration.pathSuggestions, true),
-			autoImportSuggestions: config.get<boolean>(CompletionConfiguration.autoImportSuggestions, true),
-			nameSuggestions: config.get<boolean>(CompletionConfiguration.nameSuggestions, true),
-			importStatementSuggestions: config.get<boolean>(CompletionConfiguration.importStatementSuggestions, true),
+			completeFunctionCalls: readUnifiedConfig<boolean>(CompletionConfiguration.completeFunctionCalls, false, { scope: scope, fallbackSection: modeId }),
+			pathSuggestions: readUnifiedConfig<boolean>(CompletionConfiguration.pathSuggestions, true, { scope: scope, fallbackSection: modeId }),
+			autoImportSuggestions: readUnifiedConfig<boolean>(CompletionConfiguration.autoImportSuggestions, true, { scope: scope, fallbackSection: modeId }),
+			nameSuggestions: readUnifiedConfig<boolean>(CompletionConfiguration.nameSuggestions, true, { scope: scope, fallbackSection: modeId }),
+			importStatementSuggestions: readUnifiedConfig<boolean>(CompletionConfiguration.importStatementSuggestions, true, { scope: scope, fallbackSection: modeId }),
 		};
 	}
 }
@@ -704,7 +703,7 @@ class TypeScriptCompletionItemProvider implements vscode.CompletionItemProvider<
 		token: vscode.CancellationToken,
 		context: vscode.CompletionContext
 	): Promise<vscode.CompletionList<MyCompletionItem> | undefined> {
-		if (!vscode.workspace.getConfiguration(this.language.id, document).get('suggest.enabled')) {
+		if (!readUnifiedConfig<boolean>('suggest.enabled', true, { scope: document, fallbackSection: this.language.id })) {
 			return undefined;
 		}
 
@@ -727,7 +726,7 @@ class TypeScriptCompletionItemProvider implements vscode.CompletionItemProvider<
 		}
 
 		const line = document.lineAt(position.line);
-		const completionConfiguration = CompletionConfiguration.getConfigurationForResource(this.language.id, document.uri);
+		const completionConfiguration = CompletionConfiguration.getConfigurationForResource(this.language.id, document);
 
 		if (!this.shouldTrigger(context, line, position, completionConfiguration)) {
 			return undefined;
@@ -778,11 +777,10 @@ class TypeScriptCompletionItemProvider implements vscode.CompletionItemProvider<
 				dotAccessorContext = { range, text };
 			}
 		}
-		const isIncomplete = !!response.body.isIncomplete || (response.metadata as any)?.isIncomplete;
+		const isIncomplete = !!response.body.isIncomplete || !!(response.metadata as Record<string, unknown>)?.isIncomplete;
 		const entries = response.body.entries;
 		const metadata = response.metadata;
-		// @ts-expect-error until TS 5.6
-		const defaultCommitCharacters: readonly string[] | undefined = Object.freeze(response.body.defaultCommitCharacters);
+		const defaultCommitCharacters = Object.freeze(response.body.defaultCommitCharacters);
 
 		if (response.body.optionalReplacementSpan) {
 			optionalReplacementRange = typeConverters.Range.fromTextSpan(response.body.optionalReplacementSpan);

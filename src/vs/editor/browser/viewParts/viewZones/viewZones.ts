@@ -32,6 +32,11 @@ interface IComputedViewZoneProps {
 
 const invalidFunc = () => { throw new Error(`Invalid change accessor`); };
 
+/**
+ * A view zone is a rectangle that is a section that is inserted into the editor
+ * lines that can be used for various purposes such as showing a diffs, peeking
+ * an implementation, etc.
+ */
 export class ViewZones extends ViewPart {
 
 	private _zones: { [id: string]: IMyViewZone };
@@ -191,7 +196,7 @@ export class ViewZones extends ViewPart {
 		};
 	}
 
-	public changeViewZones(callback: (changeAccessor: IViewZoneChangeAccessor) => any): boolean {
+	public changeViewZones(callback: (changeAccessor: IViewZoneChangeAccessor) => void): boolean {
 		let zonesHaveChanged = false;
 
 		this._context.viewModel.changeWhitespace((whitespaceAccessor: IWhitespaceChangeAccessor) => {
@@ -408,10 +413,11 @@ export class ViewZones extends ViewPart {
 	}
 }
 
-function safeInvoke1Arg(func: Function, arg1: any): any {
+function safeInvoke1Arg(func: Function, arg1: unknown): unknown {
 	try {
 		return func(arg1);
 	} catch (e) {
 		onUnexpectedError(e);
+		return undefined;
 	}
 }

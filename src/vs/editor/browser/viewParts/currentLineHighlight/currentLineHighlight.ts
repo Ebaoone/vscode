@@ -5,7 +5,7 @@
 
 import './currentLineHighlight.css';
 import { DynamicViewOverlay } from '../../view/dynamicViewOverlay.js';
-import { editorLineHighlight, editorLineHighlightBorder } from '../../../common/core/editorColorRegistry.js';
+import { editorLineHighlight, editorInactiveLineHighlight, editorLineHighlightBorder } from '../../../common/core/editorColorRegistry.js';
 import { RenderingContext } from '../../view/renderingContext.js';
 import { ViewContext } from '../../../common/viewModel/viewContext.js';
 import * as viewEvents from '../../../common/viewEvents.js';
@@ -201,6 +201,9 @@ export abstract class AbstractLineHighlightOverlay extends DynamicViewOverlay {
 	protected abstract _renderOne(ctx: RenderingContext, exact: boolean): string;
 }
 
+/**
+ * Emphasizes the current line by drawing a border around it.
+ */
 export class CurrentLineHighlightOverlay extends AbstractLineHighlightOverlay {
 
 	protected _renderOne(ctx: RenderingContext, exact: boolean): string {
@@ -215,6 +218,9 @@ export class CurrentLineHighlightOverlay extends AbstractLineHighlightOverlay {
 	}
 }
 
+/**
+ * Emphasizes the current line margin/gutter by drawing a border around it.
+ */
 export class CurrentLineMarginHighlightOverlay extends AbstractLineHighlightOverlay {
 	protected _renderOne(ctx: RenderingContext, exact: boolean): string {
 		const className = 'current-line' + (this._shouldRenderInMargin() ? ' current-line-margin' : '') + (this._shouldRenderOther() ? ' current-line-margin-both' : '') + (this._shouldRenderInMargin() && exact ? ' current-line-exact-margin' : '');
@@ -230,10 +236,20 @@ export class CurrentLineMarginHighlightOverlay extends AbstractLineHighlightOver
 
 registerThemingParticipant((theme, collector) => {
 	const lineHighlight = theme.getColor(editorLineHighlight);
+	const inactiveLineHighlight = theme.getColor(editorInactiveLineHighlight);
+
+	// Apply active line highlight when editor is focused
 	if (lineHighlight) {
-		collector.addRule(`.monaco-editor .view-overlays .current-line { background-color: ${lineHighlight}; }`);
-		collector.addRule(`.monaco-editor .margin-view-overlays .current-line-margin { background-color: ${lineHighlight}; border: none; }`);
+		collector.addRule(`.monaco-editor.focused .view-overlays .current-line { background-color: ${lineHighlight}; }`);
+		collector.addRule(`.monaco-editor.focused .margin-view-overlays .current-line-margin { background-color: ${lineHighlight}; border: none; }`);
 	}
+
+	// Apply inactive line highlight when editor is not focused
+	if (inactiveLineHighlight) {
+		collector.addRule(`.monaco-editor .view-overlays .current-line { background-color: ${inactiveLineHighlight}; }`);
+		collector.addRule(`.monaco-editor .margin-view-overlays .current-line-margin { background-color: ${inactiveLineHighlight}; border: none; }`);
+	}
+
 	if (!lineHighlight || lineHighlight.isTransparent() || theme.defines(editorLineHighlightBorder)) {
 		const lineHighlightBorder = theme.getColor(editorLineHighlightBorder);
 		if (lineHighlightBorder) {

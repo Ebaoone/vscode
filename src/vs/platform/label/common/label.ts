@@ -20,16 +20,19 @@ export interface ILabelService {
 	 * If `relative` is passed returns a label relative to the workspace root that the uri belongs to.
 	 * If `noPrefix` is passed does not tildify the label and also does not prepand the root name for relative labels in a multi root scenario.
 	 * If `separator` is passed, will use that over the defined path separator of the formatter.
+	 * If `appendWorkspaceSuffix` is passed, will append the name of the workspace to the label.
 	 */
-	getUriLabel(resource: URI, options?: { relative?: boolean; noPrefix?: boolean; separator?: '/' | '\\' }): string;
+	getUriLabel(resource: URI, options?: { relative?: boolean; noPrefix?: boolean; separator?: '/' | '\\'; appendWorkspaceSuffix?: boolean }): string;
 	getUriBasenameLabel(resource: URI): string;
 	getWorkspaceLabel(workspace: (IWorkspaceIdentifier | ISingleFolderWorkspaceIdentifier | URI | IWorkspace), options?: { verbose: Verbosity }): string;
 	getHostLabel(scheme: string, authority?: string): string;
 	getHostTooltip(scheme: string, authority?: string): string | undefined;
 	getSeparator(scheme: string, authority?: string): '/' | '\\';
+	/** Returns the display home containing `resource`. */
+	getUriHome(resource: URI): URI | undefined;
 
-	registerFormatter(formatter: ResourceLabelFormatter): IDisposable;
-	onDidChangeFormatters: Event<IFormatterChangeEvent>;
+	registerFormatter(formatter: ResourceLabelFormatter | ResourceLabelTemplateFormatter): IDisposable;
+	readonly onDidChangeFormatters: Event<IFormatterChangeEvent>;
 
 	/**
 	 * Registers a formatter that's cached for the machine beyond the lifecycle
@@ -52,8 +55,25 @@ export interface IFormatterChangeEvent {
 export interface ResourceLabelFormatter {
 	scheme: string;
 	authority?: string;
+	/** URI path used as a display home. Runtime registrations only. */
+	home?: string;
 	priority?: boolean;
 	formatting: ResourceLabelFormatting;
+}
+
+export interface ResourceLabelTemplateFormatter {
+	/** URI home whose optional template parameters occupy an entire path segment, such as `/sessions/${sessionId}`. */
+	home: URI;
+	/** Fires when state used by `formatting` changes and existing labels must be recomputed. */
+	onDidChangeFormatting: Event<void>;
+	/** Resolves formatting whose label is treated as literal text. */
+	formatting(context: ResourceLabelFormattingContext): ResourceLabelFormatting | undefined;
+}
+
+export interface ResourceLabelFormattingContext {
+	readonly resource: URI;
+	readonly home: URI;
+	readonly parameters: ReadonlyMap<string, string>;
 }
 
 export interface ResourceLabelFormatting {
@@ -65,4 +85,10 @@ export interface ResourceLabelFormatting {
 	workspaceTooltip?: string;
 	authorityPrefix?: string;
 	stripPathStartingSeparator?: boolean;
+	/**
+	 * Number of leading path segments to strip from `${path}` before
+	 * substitution. For example, a value of `2` turns
+	 * `/scheme/authority/rest/of/path` into `/rest/of/path`.
+	 */
+	stripPathSegments?: number;
 }

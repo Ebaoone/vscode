@@ -17,7 +17,6 @@ import { IExtensionService } from '../../../services/extensions/common/extension
 import { IDisposable, dispose } from '../../../../base/common/lifecycle.js';
 import { ICodeEditorService } from '../../../../editor/browser/services/codeEditorService.js';
 import { writeTransientState } from '../../codeEditor/browser/toggleWordWrap.js';
-import { LoaderEventType, LoaderStats, isESM } from '../../../../base/common/amd.js';
 import { IProductService } from '../../../../platform/product/common/productService.js';
 import { ITextFileService } from '../../../services/textfile/common/textfiles.js';
 import { IEditorService } from '../../../services/editor/common/editorService.js';
@@ -31,6 +30,7 @@ import { ITextResourceConfigurationService } from '../../../../editor/common/ser
 import { Registry } from '../../../../platform/registry/common/platform.js';
 import { IWorkbenchContributionsRegistry, Extensions as WorkbenchExtensions, getWorkbenchContribution } from '../../../common/contributions.js';
 import { ICustomEditorLabelService } from '../../../services/editor/common/customEditorLabelService.js';
+import { IRemoteAgentService } from '../../../services/remote/common/remoteAgentService.js';
 
 export class PerfviewContrib {
 
@@ -99,7 +99,7 @@ export class PerfviewInput extends TextResourceEditorInput {
 	}
 }
 
-class PerfModelContentProvider implements ITextModelContentProvider {
+export class PerfModelContentProvider implements ITextModelContentProvider {
 
 	private _model: ITextModel | undefined;
 	private _modelDisposables: IDisposable[] = [];
@@ -112,13 +112,14 @@ class PerfModelContentProvider implements ITextModelContentProvider {
 		@ITimerService private readonly _timerService: ITimerService,
 		@IExtensionService private readonly _extensionService: IExtensionService,
 		@IProductService private readonly _productService: IProductService,
+		@IRemoteAgentService private readonly _remoteAgentService: IRemoteAgentService,
 		@ITerminalService private readonly _terminalService: ITerminalService
 	) { }
 
 	provideTextContent(resource: URI): Promise<ITextModel> {
 
 		if (!this._model || this._model.isDisposed()) {
-			dispose(this._modelDisposables);
+			this._modelDisposables = dispose(this._modelDisposables);
 			const langId = this._languageService.createById('markdown');
 			this._model = this._modelService.getModel(resource) || this._modelService.createModel('Loading...', langId, resource);
 
@@ -139,29 +140,25 @@ class PerfModelContentProvider implements ITextModelContentProvider {
 			this._timerService.whenReady(),
 			this._lifecycleService.when(LifecyclePhase.Eventually),
 			this._extensionService.whenInstalledExtensionsRegistered(),
-			this._terminalService.whenConnected
+			// The terminal service never connects to the pty host on the web
+			isWeb && !this._remoteAgentService.getConnection()?.remoteAuthority ? Promise.resolve() : this._terminalService.whenConnected
 		]).then(() => {
 			if (this._model && !this._model.isDisposed()) {
 
-				const stats = LoaderStats.get();
 				const md = new MarkdownBuilder();
 				this._addSummary(md);
 				md.blank();
-				this._addSummaryTable(md, stats);
+				this._addSummaryTable(md);
 				md.blank();
 				this._addExtensionsTable(md);
 				md.blank();
 				this._addPerfMarksTable('Terminal Stats', md, this._timerService.getPerformanceMarks().find(e => e[0] === 'renderer')?.[1].filter(e => e.name.startsWith('code/terminal/')));
 				md.blank();
+				this._addAgentHostPerfMarksTable(md);
+				md.blank();
 				this._addWorkbenchContributionsPerfMarksTable(md);
 				md.blank();
 				this._addRawPerfMarks(md);
-				if (!isESM) {
-					md.blank();
-					this._addLoaderStats(md, stats);
-					md.blank();
-					this._addCachedDataStats(md);
-				}
 				md.blank();
 				this._addResourceTimingStats(md);
 
@@ -192,21 +189,22 @@ class PerfModelContentProvider implements ITextModelContentProvider {
 		md.li(`Empty Workspace: ${metrics.emptyWorkbench}`);
 	}
 
-	private _addSummaryTable(md: MarkdownBuilder, stats?: LoaderStats): void {
+	private _addSummaryTable(md: MarkdownBuilder): void {
 
 		const metrics = this._timerService.startupMetrics;
 		const contribTimings = Registry.as<IWorkbenchContributionsRegistry>(WorkbenchExtensions.Workbench).timings;
 
 		const table: Array<Array<string | number | undefined>> = [];
+		table.push(['import(main.js)', metrics.timers.ellapsedLoadMainBundle, '[main]', `initial startup: ${metrics.initialStartup}`]);
 		table.push(['start => app.isReady', metrics.timers.ellapsedAppReady, '[main]', `initial startup: ${metrics.initialStartup}`]);
 		table.push(['nls:start => nls:end', metrics.timers.ellapsedNlsGeneration, '[main]', `initial startup: ${metrics.initialStartup}`]);
-		table.push(['import(main.bundle.js)', metrics.timers.ellapsedLoadMainBundle, '[main]', `initial startup: ${metrics.initialStartup}`]);
+		table.push(['run main.js', metrics.timers.ellapsedRunMainBundle, '[main]', `initial startup: ${metrics.initialStartup}`]);
 		table.push(['start crash reporter', metrics.timers.ellapsedCrashReporter, '[main]', `initial startup: ${metrics.initialStartup}`]);
 		table.push(['serve main IPC handle', metrics.timers.ellapsedMainServer, '[main]', `initial startup: ${metrics.initialStartup}`]);
 		table.push(['create window', metrics.timers.ellapsedWindowCreate, '[main]', `initial startup: ${metrics.initialStartup}, ${metrics.initialStartup ? `state: ${metrics.timers.ellapsedWindowRestoreState}ms, widget: ${metrics.timers.ellapsedBrowserWindowCreate}ms, show: ${metrics.timers.ellapsedWindowMaximize}ms` : ''}`]);
 		table.push(['app.isReady => window.loadUrl()', metrics.timers.ellapsedWindowLoad, '[main]', `initial startup: ${metrics.initialStartup}`]);
 		table.push(['window.loadUrl() => begin to import(workbench.desktop.main.js)', metrics.timers.ellapsedWindowLoadToRequire, '[main->renderer]', StartupKindToString(metrics.windowKind)]);
-		table.push(['import(workbench.desktop.main.js)', metrics.timers.ellapsedRequire, '[renderer]', `cached data: ${(metrics.didUseCachedData ? 'YES' : 'NO')}${stats ? `, node_modules took ${stats.nodeRequireTotal}ms` : ''}`]);
+		table.push(['import(workbench.desktop.main.js)', metrics.timers.ellapsedRequire, '[renderer]', `cached data: ${(metrics.didUseCachedData ? 'YES' : 'NO')}`]);
 		table.push(['wait for window config', metrics.timers.ellapsedWaitForWindowConfig, '[renderer]', undefined]);
 		table.push(['init storage (global & workspace)', metrics.timers.ellapsedStorageInit, '[renderer]', undefined]);
 		table.push(['init workspace service', metrics.timers.ellapsedWorkspaceServiceInit, '[renderer]', undefined]);
@@ -215,10 +213,11 @@ class PerfModelContentProvider implements ITextModelContentProvider {
 			table.push(['init keybindings, snippets & extensions from settings sync service', metrics.timers.ellapsedOtherUserDataInit, '[renderer]', undefined]);
 		}
 		table.push(['register extensions & spawn extension host', metrics.timers.ellapsedExtensions, '[renderer]', undefined]);
-		table.push(['restore viewlet', metrics.timers.ellapsedViewletRestore, '[renderer]', metrics.viewletId]);
+		table.push(['restore primary viewlet', metrics.timers.ellapsedViewletRestore, '[renderer]', metrics.viewletId]);
+		table.push(['restore secondary viewlet', metrics.timers.ellapsedAuxiliaryViewletRestore, '[renderer]', metrics.auxiliaryViewletId]);
 		table.push(['restore panel', metrics.timers.ellapsedPanelRestore, '[renderer]', metrics.panelId]);
 		table.push(['restore & resolve visible editors', metrics.timers.ellapsedEditorRestore, '[renderer]', `${metrics.editorIds.length}: ${metrics.editorIds.join(', ')}`]);
-		table.push(['create workbench contributions', metrics.timers.ellapsedWorkbenchContributions, '[renderer]', `${(contribTimings.get(LifecyclePhase.Starting)?.length ?? 0) + (contribTimings.get(LifecyclePhase.Starting)?.length ?? 0)} blocking startup`]);
+		table.push(['create workbench contributions', metrics.timers.ellapsedWorkbenchContributions, '[renderer]', `${(contribTimings.get(LifecyclePhase.Starting)?.length ?? 0) + (contribTimings.get(LifecyclePhase.Ready)?.length ?? 0)} blocking startup`]);
 		table.push(['overall workbench load', metrics.timers.ellapsedWorkbench, '[renderer]', undefined]);
 		table.push(['workbench ready', metrics.ellapsed, '[main->renderer]', undefined]);
 		table.push(['renderer ready', metrics.timers.ellapsedRenderer, '[renderer]', undefined]);
@@ -275,6 +274,14 @@ class PerfModelContentProvider implements ITextModelContentProvider {
 		md.table(['Name', 'Timestamp', 'Delta', 'Total'], table);
 	}
 
+	private _addAgentHostPerfMarksTable(md: MarkdownBuilder): void {
+		const marks = perf.getMarks();
+		if (!marks.some(mark => mark.name.startsWith('code/agentHost/'))) {
+			return;
+		}
+		this._addPerfMarksTable('Agent Host Startup', md, marks.filter(mark => mark.name === 'code/timeOrigin' || mark.name.startsWith('code/agentHost/')));
+	}
+
 	private _addWorkbenchContributionsPerfMarksTable(md: MarkdownBuilder): void {
 		md.heading(2, 'Workbench Contributions Blocking Restore');
 
@@ -310,58 +317,6 @@ class PerfModelContentProvider implements ITextModelContentProvider {
 		}
 	}
 
-	private _addLoaderStats(md: MarkdownBuilder, stats: LoaderStats): void {
-		md.heading(2, 'Loader Stats');
-		md.heading(3, 'Load AMD-module');
-		md.table(['Module', 'Duration'], stats.amdLoad);
-		md.blank();
-		md.heading(3, 'Load commonjs-module');
-		md.table(['Module', 'Duration'], stats.nodeRequire);
-		md.blank();
-		md.heading(3, 'Invoke AMD-module factory');
-		md.table(['Module', 'Duration'], stats.amdInvoke);
-		md.blank();
-		md.heading(3, 'Invoke commonjs-module');
-		md.table(['Module', 'Duration'], stats.nodeEval);
-	}
-
-	private _addCachedDataStats(md: MarkdownBuilder): void {
-
-		const map = new Map<LoaderEventType, string[]>();
-		map.set(LoaderEventType.CachedDataCreated, []);
-		map.set(LoaderEventType.CachedDataFound, []);
-		map.set(LoaderEventType.CachedDataMissed, []);
-		map.set(LoaderEventType.CachedDataRejected, []);
-		if (!isESM && typeof require.getStats === 'function') {
-			for (const stat of require.getStats()) {
-				if (map.has(stat.type)) {
-					map.get(stat.type)!.push(stat.detail);
-				}
-			}
-		}
-
-		const printLists = (arr?: string[]) => {
-			if (arr) {
-				arr.sort();
-				for (const e of arr) {
-					md.li(`${e}`);
-				}
-				md.blank();
-			}
-		};
-
-		md.heading(2, 'Node Cached Data Stats');
-		md.blank();
-		md.heading(3, 'cached data used');
-		printLists(map.get(LoaderEventType.CachedDataFound));
-		md.heading(3, 'cached data missed');
-		printLists(map.get(LoaderEventType.CachedDataMissed));
-		md.heading(3, 'cached data rejected');
-		printLists(map.get(LoaderEventType.CachedDataRejected));
-		md.heading(3, 'cached data created (lazy, might need refreshes)');
-		printLists(map.get(LoaderEventType.CachedDataCreated));
-	}
-
 	private _addResourceTimingStats(md: MarkdownBuilder) {
 		const stats = performance.getEntriesByType('resource').map(entry => {
 			return [entry.name, entry.duration];
@@ -394,6 +349,42 @@ class MarkdownBuilder {
 	}
 
 	table(header: string[], rows: Array<Array<{ toString(): string } | undefined>>) {
-		this.value += LoaderStats.toMarkdownTable(header, rows);
+		this.value += this.toMarkdownTable(header, rows);
+	}
+
+	private toMarkdownTable(header: string[], rows: Array<Array<{ toString(): string } | undefined>>): string {
+		let result = '';
+
+		const lengths: number[] = [];
+		header.forEach((cell, ci) => {
+			lengths[ci] = cell.length;
+		});
+		rows.forEach(row => {
+			row.forEach((cell, ci) => {
+				if (typeof cell === 'undefined') {
+					cell = row[ci] = '-';
+				}
+				const len = cell.toString().length;
+				lengths[ci] = Math.max(len, lengths[ci]);
+			});
+		});
+
+		// header
+		header.forEach((cell, ci) => { result += `| ${cell + ' '.repeat(lengths[ci] - cell.toString().length)} `; });
+		result += '|\n';
+		header.forEach((_cell, ci) => { result += `| ${'-'.repeat(lengths[ci])} `; });
+		result += '|\n';
+
+		// cells
+		rows.forEach(row => {
+			row.forEach((cell, ci) => {
+				if (typeof cell !== 'undefined') {
+					result += `| ${cell + ' '.repeat(lengths[ci] - cell.toString().length)} `;
+				}
+			});
+			result += '|\n';
+		});
+
+		return result;
 	}
 }

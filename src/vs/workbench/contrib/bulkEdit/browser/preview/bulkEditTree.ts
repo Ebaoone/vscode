@@ -10,7 +10,7 @@ import { IResourceLabel, ResourceLabels } from '../../../../browser/labels.js';
 import { HighlightedLabel, IHighlight } from '../../../../../base/browser/ui/highlightedlabel/highlightedLabel.js';
 import { IIdentityProvider, IListVirtualDelegate, IKeyboardNavigationLabelProvider } from '../../../../../base/browser/ui/list/list.js';
 import { Range } from '../../../../../editor/common/core/range.js';
-import * as dom from '../../../../../base/browser/dom.js';
+import { Checkbox } from '../../../../../base/browser/ui/toggle/toggle.js';
 import { ITextModel } from '../../../../../editor/common/model.js';
 import { IDisposable, DisposableStore } from '../../../../../base/common/lifecycle.js';
 import { TextModel } from '../../../../../editor/common/model/textModel.js';
@@ -30,6 +30,8 @@ import { PLAINTEXT_LANGUAGE_ID } from '../../../../../editor/common/languages/mo
 import { SnippetParser } from '../../../../../editor/contrib/snippet/browser/snippetParser.js';
 import { AriaRole } from '../../../../../base/browser/ui/aria/aria.js';
 import { IInstantiationService } from '../../../../../platform/instantiation/common/instantiation.js';
+import * as css from '../../../../../base/browser/cssValue.js';
+import { defaultCheckboxStyles } from '../../../../../platform/theme/browser/defaultStyles.js';
 
 // --- VIEW MODEL
 
@@ -436,14 +438,14 @@ export class CategoryElementRenderer implements ITreeRenderer<CategoryElement, F
 		} else if (URI.isUri(metadata.iconPath)) {
 			// background-image
 			template.icon.className = 'uri-icon';
-			template.icon.style.setProperty('--background-dark', dom.asCSSUrl(metadata.iconPath));
-			template.icon.style.setProperty('--background-light', dom.asCSSUrl(metadata.iconPath));
+			template.icon.style.setProperty('--background-dark', css.asCSSUrl(metadata.iconPath));
+			template.icon.style.setProperty('--background-light', css.asCSSUrl(metadata.iconPath));
 
 		} else if (metadata.iconPath) {
 			// background-image
 			template.icon.className = 'uri-icon';
-			template.icon.style.setProperty('--background-dark', dom.asCSSUrl(metadata.iconPath.dark));
-			template.icon.style.setProperty('--background-light', dom.asCSSUrl(metadata.iconPath.light));
+			template.icon.style.setProperty('--background-dark', css.asCSSUrl(metadata.iconPath.dark));
+			template.icon.style.setProperty('--background-light', css.asCSSUrl(metadata.iconPath.light));
 		}
 
 		template.label.setLabel(metadata.label, metadata.description, {
@@ -461,7 +463,7 @@ class FileElementTemplate {
 	private readonly _disposables = new DisposableStore();
 	private readonly _localDisposables = new DisposableStore();
 
-	private readonly _checkbox: HTMLInputElement;
+	private readonly _checkbox: Checkbox;
 	private readonly _label: IResourceLabel;
 	private readonly _details: HTMLSpanElement;
 
@@ -471,11 +473,10 @@ class FileElementTemplate {
 		@ILabelService private readonly _labelService: ILabelService,
 	) {
 
-		this._checkbox = document.createElement('input');
-		this._checkbox.className = 'edit-checkbox';
-		this._checkbox.type = 'checkbox';
-		this._checkbox.setAttribute('role', 'checkbox');
-		container.appendChild(this._checkbox);
+		this._checkbox = this._disposables.add(new Checkbox('', false, defaultCheckboxStyles));
+		this._checkbox.domNode.classList.add('edit-checkbox');
+		this._checkbox.domNode.tabIndex = -1;
+		container.appendChild(this._checkbox.domNode);
 
 		this._label = resourceLabels.create(container, { supportHighlights: true });
 
@@ -494,8 +495,14 @@ class FileElementTemplate {
 		this._localDisposables.clear();
 
 		this._checkbox.checked = element.isChecked();
-		this._checkbox.disabled = element.isDisabled();
-		this._localDisposables.add(dom.addDisposableListener(this._checkbox, 'change', () => {
+		if (element.isDisabled()) {
+			this._checkbox.disable();
+		} else {
+			this._checkbox.enable();
+		}
+		// enable()/disable() reset the tabIndex; keep the checkbox out of the tree's tab order
+		this._checkbox.domNode.tabIndex = -1;
+		this._localDisposables.add(this._checkbox.onChange(() => {
 			element.setChecked(this._checkbox.checked);
 		}));
 
@@ -560,18 +567,17 @@ class TextEditElementTemplate {
 	private readonly _disposables = new DisposableStore();
 	private readonly _localDisposables = new DisposableStore();
 
-	private readonly _checkbox: HTMLInputElement;
+	private readonly _checkbox: Checkbox;
 	private readonly _icon: HTMLDivElement;
 	private readonly _label: HighlightedLabel;
 
 	constructor(container: HTMLElement, @IThemeService private readonly _themeService: IThemeService) {
 		container.classList.add('textedit');
 
-		this._checkbox = document.createElement('input');
-		this._checkbox.className = 'edit-checkbox';
-		this._checkbox.type = 'checkbox';
-		this._checkbox.setAttribute('role', 'checkbox');
-		container.appendChild(this._checkbox);
+		this._checkbox = this._disposables.add(new Checkbox('', false, defaultCheckboxStyles));
+		this._checkbox.domNode.classList.add('edit-checkbox');
+		this._checkbox.domNode.tabIndex = -1;
+		container.appendChild(this._checkbox.domNode);
 
 		this._icon = document.createElement('div');
 		container.appendChild(this._icon);
@@ -587,17 +593,17 @@ class TextEditElementTemplate {
 	set(element: TextEditElement) {
 		this._localDisposables.clear();
 
-		this._localDisposables.add(dom.addDisposableListener(this._checkbox, 'change', e => {
+		this._localDisposables.add(this._checkbox.onChange(() => {
 			element.setChecked(this._checkbox.checked);
-			e.preventDefault();
 		}));
-		if (element.parent.isChecked()) {
-			this._checkbox.checked = element.isChecked();
-			this._checkbox.disabled = element.isDisabled();
+		this._checkbox.checked = element.isChecked();
+		if (element.isDisabled()) {
+			this._checkbox.disable();
 		} else {
-			this._checkbox.checked = element.isChecked();
-			this._checkbox.disabled = element.isDisabled();
+			this._checkbox.enable();
 		}
+		// enable()/disable() reset the tabIndex; keep the checkbox out of the tree's tab order
+		this._checkbox.domNode.tabIndex = -1;
 
 		let value = '';
 		value += element.prefix;
@@ -635,14 +641,14 @@ class TextEditElementTemplate {
 			} else if (URI.isUri(iconPath)) {
 				// background-image
 				this._icon.className = 'uri-icon';
-				this._icon.style.setProperty('--background-dark', dom.asCSSUrl(iconPath));
-				this._icon.style.setProperty('--background-light', dom.asCSSUrl(iconPath));
+				this._icon.style.setProperty('--background-dark', css.asCSSUrl(iconPath));
+				this._icon.style.setProperty('--background-light', css.asCSSUrl(iconPath));
 
 			} else {
 				// background-image
 				this._icon.className = 'uri-icon';
-				this._icon.style.setProperty('--background-dark', dom.asCSSUrl(iconPath.dark));
-				this._icon.style.setProperty('--background-light', dom.asCSSUrl(iconPath.light));
+				this._icon.style.setProperty('--background-dark', css.asCSSUrl(iconPath.dark));
+				this._icon.style.setProperty('--background-light', css.asCSSUrl(iconPath.light));
 			}
 		}
 
@@ -667,7 +673,9 @@ export class TextEditElementRenderer implements ITreeRenderer<TextEditElement, F
 		template.set(element);
 	}
 
-	disposeTemplate(_template: TextEditElementTemplate): void { }
+	disposeTemplate(template: TextEditElementTemplate): void {
+		template.dispose();
+	}
 }
 
 export class BulkEditDelegate implements IListVirtualDelegate<BulkEditElement> {

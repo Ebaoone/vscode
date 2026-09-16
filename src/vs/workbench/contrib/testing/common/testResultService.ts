@@ -7,7 +7,7 @@ import { findFirstIdxMonotonousOrArrLen } from '../../../../base/common/arraysFi
 import { RunOnceScheduler } from '../../../../base/common/async.js';
 import { Emitter, Event } from '../../../../base/common/event.js';
 import { createSingleCallFunction } from '../../../../base/common/functional.js';
-import { Disposable, DisposableStore, dispose, toDisposable } from '../../../../base/common/lifecycle.js';
+import { Disposable, DisposableMap, DisposableStore } from '../../../../base/common/lifecycle.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
 import { IContextKey, IContextKeyService } from '../../../../platform/contextkey/common/contextkey.js';
 import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js';
@@ -76,8 +76,9 @@ export class TestResultService extends Disposable implements ITestResultService 
 	declare _serviceBrand: undefined;
 	private changeResultEmitter = this._register(new Emitter<ResultChangeEvent>());
 	private _results: ITestResult[] = [];
-	private readonly _resultsDisposables: DisposableStore[] = [];
+	private readonly _resultsDisposables = this._register(new DisposableMap<ITestResult, DisposableStore>());
 	private testChangeEmitter = this._register(new Emitter<TestResultItemChange>());
+	private insertOrderCounter = 0;
 
 	/**
 	 * @inheritdoc
@@ -105,7 +106,7 @@ export class TestResultService extends Disposable implements ITestResultService 
 		}
 	}));
 
-	protected readonly persistScheduler = new RunOnceScheduler(() => this.persistImmediately(), 500);
+	protected readonly persistScheduler = this._register(new RunOnceScheduler(() => this.persistImmediately(), 500));
 
 	constructor(
 		@IContextKeyService contextKeyService: IContextKeyService,
@@ -114,7 +115,6 @@ export class TestResultService extends Disposable implements ITestResultService 
 		@ITelemetryService private readonly telemetryService: ITelemetryService,
 	) {
 		super();
-		this._register(toDisposable(() => dispose(this._resultsDisposables)));
 		this.isRunning = TestingContextKeys.isRunning.bindTo(contextKeyService);
 		this.hasAnyResults = TestingContextKeys.hasAnyResults.bindTo(contextKeyService);
 	}
@@ -139,7 +139,7 @@ export class TestResultService extends Disposable implements ITestResultService 
 	public createLiveResult(req: ResolvedTestRunRequest | ExtensionRunTestsRequest) {
 		if ('targets' in req) {
 			const id = generateUuid();
-			return this.push(new LiveTestResult(id, true, req, this.telemetryService));
+			return this.push(new LiveTestResult(id, true, req, this.insertOrderCounter++, this.telemetryService));
 		}
 
 		let profile: ITestRunProfile | undefined;
@@ -164,7 +164,7 @@ export class TestResultService extends Disposable implements ITestResultService 
 			});
 		}
 
-		return this.push(new LiveTestResult(req.id, req.persist, resolved, this.telemetryService));
+		return this.push(new LiveTestResult(req.id, req.persist, resolved, this.insertOrderCounter++, this.telemetryService));
 	}
 
 	/**
@@ -180,18 +180,25 @@ export class TestResultService extends Disposable implements ITestResultService 
 		}
 
 		this.hasAnyResults.set(true);
+		let removed: ITestResult | undefined;
 		if (this.results.length > RETAIN_MAX_RESULTS) {
-			this.results.pop();
-			this._resultsDisposables.pop()?.dispose();
+			removed = this.results.pop();
 		}
 
 		const ds = new DisposableStore();
-		this._resultsDisposables.push(ds);
+		this._resultsDisposables.set(result, ds);
 
 		if (result instanceof LiveTestResult) {
 			ds.add(result);
 			ds.add(result.onComplete(() => this.onComplete(result)));
 			ds.add(result.onChange(this.testChangeEmitter.fire, this.testChangeEmitter));
+		}
+
+		if (removed) {
+			this._resultsDisposables.deleteAndDispose(removed);
+		}
+
+		if (result instanceof LiveTestResult) {
 			this.isRunning.set(true);
 			this.changeResultEmitter.fire({ started: result });
 		} else {
@@ -236,6 +243,9 @@ export class TestResultService extends Disposable implements ITestResultService 
 		}
 
 		this._results = keep;
+		for (const result of removed) {
+			this._resultsDisposables.deleteAndDispose(result);
+		}
 		this.persistScheduler.schedule();
 		if (keep.length === 0) {
 			this.hasAnyResults.set(false);
@@ -251,7 +261,17 @@ export class TestResultService extends Disposable implements ITestResultService 
 	}
 
 	private resort() {
-		this.results.sort((a, b) => (b.completedAt ?? Number.MAX_SAFE_INTEGER) - (a.completedAt ?? Number.MAX_SAFE_INTEGER));
+		this.results.sort((a, b) => {
+			// Running tests should always be sorted higher:
+			if (!!a.completedAt !== !!b.completedAt) {
+				return a.completedAt === undefined ? -1 : 1;
+			}
+
+			// Otherwise sort by insertion order, hydrated tests are always last:
+			const aComp = a instanceof LiveTestResult ? a.insertOrder : -1;
+			const bComp = b instanceof LiveTestResult ? b.insertOrder : -1;
+			return bComp - aComp;
+		});
 	}
 
 	private updateIsRunning() {

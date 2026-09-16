@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { ServiceCollection } from '../../platform/instantiation/common/serviceCollection.js';
-import { ConsoleLogger, getLogLevel, ILoggerService, ILogService, NullLogger } from '../../platform/log/common/log.js';
+import { ConsoleLogger, getLogLevel, ILoggerService, ILogService } from '../../platform/log/common/log.js';
 import { SyncDescriptor } from '../../platform/instantiation/common/descriptors.js';
 import { ConfigurationService } from '../../platform/configuration/common/configurationService.js';
 import { IConfigurationService } from '../../platform/configuration/common/configuration.js';
@@ -12,7 +12,7 @@ import { IRequestService } from '../../platform/request/common/request.js';
 import { RequestService } from '../../platform/request/node/requestService.js';
 import { NullTelemetryService } from '../../platform/telemetry/common/telemetryUtils.js';
 import { ITelemetryService } from '../../platform/telemetry/common/telemetry.js';
-import { IExtensionGalleryService, InstallOptions } from '../../platform/extensionManagement/common/extensionManagement.js';
+import { IAllowedExtensionsService, IExtensionGalleryService, InstallOptions } from '../../platform/extensionManagement/common/extensionManagement.js';
 import { ExtensionGalleryServiceWithNoStorageService } from '../../platform/extensionManagement/common/extensionGalleryService.js';
 import { ExtensionManagementService, INativeServerExtensionManagementService } from '../../platform/extensionManagement/node/extensionManagementService.js';
 import { ExtensionSignatureVerificationService, IExtensionSignatureVerificationService } from '../../platform/extensionManagement/node/extensionSignatureVerificationService.js';
@@ -25,7 +25,7 @@ import { DiskFileSystemProvider } from '../../platform/files/node/diskFileSystem
 import { Schemas } from '../../base/common/network.js';
 import { IFileService } from '../../platform/files/common/files.js';
 import { IProductService } from '../../platform/product/common/productService.js';
-import { IServerEnvironmentService, ServerEnvironmentService, ServerParsedArgs } from './serverEnvironmentService.js';
+import { getRedactedServerParsedArgs, IServerEnvironmentService, ServerEnvironmentService, ServerParsedArgs } from './serverEnvironmentService.js';
 import { ExtensionManagementCLI } from '../../platform/extensionManagement/common/extensionManagementCLI.js';
 import { ILanguagePackService } from '../../platform/languagePacks/common/languagePacks.js';
 import { NativeLanguagePackService } from '../../platform/languagePacks/node/languagePacks.js';
@@ -50,6 +50,9 @@ import { LogService } from '../../platform/log/common/logService.js';
 import { LoggerService } from '../../platform/log/node/loggerService.js';
 import { localize } from '../../nls.js';
 import { addUNCHostToAllowlist, disableUNCAccessRestrictions } from '../../base/node/unc.js';
+import { AllowedExtensionsService } from '../../platform/extensionManagement/common/allowedExtensionsService.js';
+import { IExtensionGalleryManifestService } from '../../platform/extensionManagement/common/extensionGalleryManifest.js';
+import { ExtensionGalleryManifestService } from '../../platform/extensionManagement/common/extensionGalleryManifestService.js';
 
 class CliMain extends Disposable {
 
@@ -60,8 +63,7 @@ class CliMain extends Disposable {
 	}
 
 	private registerListeners(): void {
-		// Dispose on exit
-		process.once('exit', () => this.dispose());
+		process.once('exit', () => this.dispose()); // Dispose on exit
 	}
 
 	async run(): Promise<void> {
@@ -69,6 +71,7 @@ class CliMain extends Disposable {
 		await instantiationService.invokeFunction(async accessor => {
 			const configurationService = accessor.get(IConfigurationService);
 			const logService = accessor.get(ILogService);
+			const productService = accessor.get(IProductService);
 
 			// On Windows, configure the UNC allow list based on settings
 			if (isWindows) {
@@ -80,7 +83,7 @@ class CliMain extends Disposable {
 			}
 
 			try {
-				await this.doRun(instantiationService.createInstance(ExtensionManagementCLI, new ConsoleLogger(logService.getLevel(), false)));
+				await this.doRun(instantiationService.createInstance(ExtensionManagementCLI, productService.extensionsForceVersionByQuality ?? [], new ConsoleLogger(logService.getLevel(), false)));
 			} catch (error) {
 				logService.error(error);
 				console.error(getErrorMessage(error));
@@ -104,7 +107,7 @@ class CliMain extends Disposable {
 		const logService = new LogService(this._register(loggerService.createLogger('remoteCLI', { name: localize('remotecli', "Remote CLI") })));
 		services.set(ILogService, logService);
 		logService.trace(`Remote configuration data at ${this.remoteDataFolder}`);
-		logService.trace('process arguments:', this.args);
+		logService.trace('process arguments:', getRedactedServerParsedArgs(this.args));
 
 		// Files
 		const fileService = this._register(new FileService(logService));
@@ -128,13 +131,15 @@ class CliMain extends Disposable {
 			userDataProfilesService.init()
 		]);
 
-		services.set(IRequestService, new SyncDescriptor(RequestService, [new NullLogger()]));
+		services.set(IRequestService, new SyncDescriptor(RequestService, ['remote']));
 		services.set(IDownloadService, new SyncDescriptor(DownloadService));
 		services.set(ITelemetryService, NullTelemetryService);
+		services.set(IExtensionGalleryManifestService, new SyncDescriptor(ExtensionGalleryManifestService));
 		services.set(IExtensionGalleryService, new SyncDescriptor(ExtensionGalleryServiceWithNoStorageService));
 		services.set(IExtensionsProfileScannerService, new SyncDescriptor(ExtensionsProfileScannerService));
 		services.set(IExtensionsScannerService, new SyncDescriptor(ExtensionsScannerService));
 		services.set(IExtensionSignatureVerificationService, new SyncDescriptor(ExtensionSignatureVerificationService));
+		services.set(IAllowedExtensionsService, new SyncDescriptor(AllowedExtensionsService));
 		services.set(INativeServerExtensionManagementService, new SyncDescriptor(ExtensionManagementService));
 		services.set(ILanguagePackService, new SyncDescriptor(NativeLanguagePackService));
 
@@ -150,7 +155,7 @@ class CliMain extends Disposable {
 
 		// Install Extension
 		else if (this.args['install-extension'] || this.args['install-builtin-extension']) {
-			const installOptions: InstallOptions = { isMachineScoped: !!this.args['do-not-sync'], installPreReleaseVersion: !!this.args['pre-release'] };
+			const installOptions: InstallOptions = { isMachineScoped: !!this.args['do-not-sync'], installPreReleaseVersion: !!this.args['pre-release'], donotIncludePackAndDependencies: !!this.args['do-not-include-pack-dependencies'] };
 			return extensionManagementCLI.installExtensions(this.asExtensionIdOrVSIX(this.args['install-extension'] || []), this.asExtensionIdOrVSIX(this.args['install-builtin-extension'] || []), installOptions, !!this.args['force']);
 		}
 
@@ -185,12 +190,12 @@ export async function run(args: ServerParsedArgs, REMOTE_DATA_FOLDER: string, op
 		console.log(buildHelpMessage(product.nameLong, executable, product.version, optionDescriptions, { noInputFiles: true, noPipe: true }));
 		return;
 	}
+
 	// Version Info
 	if (args.version) {
 		console.log(buildVersionMessage(product.version, product.commit));
 		return;
 	}
-
 
 	const cliMain = new CliMain(args, REMOTE_DATA_FOLDER);
 	try {

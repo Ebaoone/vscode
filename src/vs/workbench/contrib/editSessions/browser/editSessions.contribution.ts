@@ -21,7 +21,7 @@ import { IConfigurationService } from '../../../../platform/configuration/common
 import { IProgress, IProgressService, IProgressStep, ProgressLocation } from '../../../../platform/progress/common/progress.js';
 import { EditSessionsWorkbenchService } from './editSessionsStorageService.js';
 import { InstantiationType, registerSingleton } from '../../../../platform/instantiation/common/extensions.js';
-import { UserDataSyncErrorCode, UserDataSyncStoreError, IUserDataSynchroniser } from '../../../../platform/userDataSync/common/userDataSync.js';
+import { UserDataSyncErrorCode, UserDataSyncStoreError } from '../../../../platform/userDataSync/common/userDataSync.js';
 import { ITelemetryService } from '../../../../platform/telemetry/common/telemetry.js';
 import { INotificationService, Severity } from '../../../../platform/notification/common/notification.js';
 import { getFileNamesMessage, IDialogService, IFileDialogService } from '../../../../platform/dialogs/common/dialogs.js';
@@ -53,7 +53,6 @@ import { equals } from '../../../../base/common/objects.js';
 import { EditSessionIdentityMatch, IEditSessionIdentityService } from '../../../../platform/workspace/common/editSessions.js';
 import { ThemeIcon } from '../../../../base/common/themables.js';
 import { IOutputService } from '../../../services/output/common/output.js';
-import { sha1Hex } from '../../../../base/browser/hash.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
 import { IActivityService, NumberBadge } from '../../../services/activity/common/activity.js';
 import { IEditorService } from '../../../services/editor/common/editorService.js';
@@ -61,14 +60,15 @@ import { ILocalizedString } from '../../../../platform/action/common/action.js';
 import { Codicon } from '../../../../base/common/codicons.js';
 import { CancellationError } from '../../../../base/common/errors.js';
 import { IRemoteAgentService } from '../../../services/remote/common/remoteAgentService.js';
-import { IExtensionsViewPaneContainer, VIEWLET_ID } from '../../extensions/common/extensions.js';
-import { IPaneCompositePartService } from '../../../services/panecomposite/browser/panecomposite.js';
+import { IExtensionsWorkbenchService } from '../../extensions/common/extensions.js';
 import { WorkspaceStateSynchroniser } from '../common/workspaceStateSync.js';
 import { IUserDataProfilesService } from '../../../../platform/userDataProfile/common/userDataProfile.js';
 import { IRequestService } from '../../../../platform/request/common/request.js';
 import { EditSessionsStoreClient } from '../common/editSessionsStorageClient.js';
 import { IUriIdentityService } from '../../../../platform/uriIdentity/common/uriIdentity.js';
 import { IWorkspaceIdentityService } from '../../../services/workspaces/common/workspaceIdentityService.js';
+import { hashAsync } from '../../../../base/common/hash.js';
+import { ResourceSet } from '../../../../base/common/map.js';
 
 registerSingleton(IEditSessionsLogService, EditSessionsLogService, InstantiationType.Delayed);
 registerSingleton(IEditSessionsStorageService, EditSessionsWorkbenchService, InstantiationType.Delayed);
@@ -101,10 +101,7 @@ registerAction2(class extends Action2 {
 	}
 
 	async run(accessor: ServicesAccessor): Promise<void> {
-		const paneCompositePartService = accessor.get(IPaneCompositePartService);
-		const viewlet = await paneCompositePartService.openPaneComposite(VIEWLET_ID, ViewContainerLocation.Sidebar, true);
-		const view = viewlet?.getViewPaneContainer() as IExtensionsViewPaneContainer | undefined;
-		view?.search('@tag:continueOn');
+		return accessor.get(IExtensionsWorkbenchService).openSearch('@tag:continueOn');
 	}
 });
 
@@ -128,7 +125,7 @@ export class EditSessionsContribution extends Disposable implements IWorkbenchCo
 
 	private registeredCommands = new Set<string>();
 
-	private workspaceStateSynchronizer: IUserDataSynchroniser | undefined;
+	private workspaceStateSynchronizer: WorkspaceStateSynchroniser | undefined;
 	private editSessionsStorageClient: EditSessionsStoreClient | undefined;
 
 	constructor(
@@ -183,11 +180,11 @@ export class EditSessionsContribution extends Disposable implements IWorkbenchCo
 		this.registerContributedEditSessionOptions();
 
 		this._register(this.fileService.registerProvider(EditSessionsFileSystemProvider.SCHEMA, new EditSessionsFileSystemProvider(this.editSessionsStorageService)));
-		this.lifecycleService.onWillShutdown((e) => {
+		this._register(this.lifecycleService.onWillShutdown((e) => {
 			if (e.reason !== ShutdownReason.RELOAD && this.editSessionsStorageService.isSignedIn && this.configurationService.getValue('workbench.experimental.cloudChanges.autoStore') === 'onShutdown' && !isWeb) {
 				e.join(this.autoStoreEditSession(), { id: 'autoStoreWorkingChanges', label: localize('autoStoreWorkingChanges', 'Storing current working changes...') });
 			}
-		});
+		}));
 		this._register(this.editSessionsStorageService.onDidSignIn(() => this.updateAccountsMenuBadge()));
 		this._register(this.editSessionsStorageService.onDidSignOut(() => this.updateAccountsMenuBadge()));
 	}
@@ -305,7 +302,7 @@ export class EditSessionsContribution extends Disposable implements IWorkbenchCo
 				super(showOutputChannelCommand);
 			}
 
-			run(accessor: ServicesAccessor, ...args: any[]) {
+			run(accessor: ServicesAccessor, ...args: unknown[]) {
 				const outputChannel = accessor.get(IOutputService);
 				void outputChannel.showChannel(editSessionsLogId);
 			}
@@ -410,7 +407,7 @@ export class EditSessionsContribution extends Disposable implements IWorkbenchCo
 					// Open the URI
 					that.logService.info(`Opening ${uri.toString()}`);
 					await that.openerService.open(uri, { openExternal: true });
-				} else if (!shouldStoreEditSession && uri !== 'noDestinationUri') {
+				} else if ((!shouldStoreEditSession || ref === undefined) && uri !== 'noDestinationUri') {
 					// Open the URI without an edit session ref
 					that.logService.info(`Opening ${uri.toString()}`);
 					await that.openerService.open(uri, { openExternal: true });
@@ -569,7 +566,7 @@ export class EditSessionsContribution extends Disposable implements IWorkbenchCo
 				}
 			}
 
-			await this.workspaceStateSynchronizer?.apply(false, {});
+			await this.workspaceStateSynchronizer?.apply();
 
 			this.logService.info(`Deleting edit session with ref ${ref} after successfully applying it to current workspace...`);
 			await this.editSessionsStorageService.delete('editSessions', ref);
@@ -647,6 +644,10 @@ export class EditSessionsContribution extends Disposable implements IWorkbenchCo
 
 			for (const change of folder.workingChanges) {
 				const uri = joinPath(folderRoot.uri, change.relativeFilePath);
+				if (!this.uriIdentityService.extUri.isEqualOrParent(uri, folderRoot.uri) || this.uriIdentityService.extUri.isEqual(uri, folderRoot.uri)) {
+					this.logService.warn(`Skipping change outside workspace folder: ${change.relativeFilePath}`);
+					continue;
+				}
 
 				changes.push({ uri, type: change.type, contents: change.contents });
 				if (await this.willChangeLocalContents(localChanges, uri, change)) {
@@ -667,7 +668,10 @@ export class EditSessionsContribution extends Disposable implements IWorkbenchCo
 
 		switch (type) {
 			case (ChangeType.Addition): {
-				const [originalContents, incomingContents] = await Promise.all([sha1Hex(contents), sha1Hex(encodeBase64((await this.fileService.readFile(uriWithIncomingChanges)).value))]);
+				const [originalContents, incomingContents] = await Promise.all([
+					hashAsync(contents),
+					hashAsync(encodeBase64((await this.fileService.readFile(uriWithIncomingChanges)).value))
+				]);
 				return originalContents !== incomingContents;
 			}
 			case (ChangeType.Deletion): {
@@ -686,6 +690,24 @@ export class EditSessionsContribution extends Disposable implements IWorkbenchCo
 		// Save all saveable editors before building edit session contents
 		await this.editorService.saveAll();
 
+		// Do a first pass over all repositories to ensure that the edit session identity is created for each.
+		// This may change the working changes that need to be stored later
+		const createdEditSessionIdentities = new ResourceSet();
+		for (const repository of this.scmService.repositories) {
+			const changedResources = this.getChangedResources(repository);
+			if (!changedResources.size) {
+				continue;
+			}
+			for (const uri of changedResources) {
+				const workspaceFolder = this.contextService.getWorkspaceFolder(uri);
+				if (!workspaceFolder || createdEditSessionIdentities.has(uri)) {
+					continue;
+				}
+				createdEditSessionIdentities.add(uri);
+				await this.editSessionIdentityService.onWillCreateEditSessionIdentity(workspaceFolder, cancellationToken);
+			}
+		}
+
 		for (const repository of this.scmService.repositories) {
 			// Look through all resource groups and compute which files were added/modified/deleted
 			const trackedUris = this.getChangedResources(repository); // A URI might appear in more than one resource group
@@ -703,8 +725,6 @@ export class EditSessionsContribution extends Disposable implements IWorkbenchCo
 
 					continue;
 				}
-
-				await this.editSessionIdentityService.onWillCreateEditSessionIdentity(workspaceFolder, cancellationToken);
 
 				name = name ?? workspaceFolder.name;
 				const relativeFilePath = relativePath(workspaceFolder.uri, uri) ?? uri.path;
@@ -744,7 +764,7 @@ export class EditSessionsContribution extends Disposable implements IWorkbenchCo
 		}
 
 		// Store contributed workspace state
-		await this.workspaceStateSynchronizer?.sync(null, {});
+		await this.workspaceStateSynchronizer?.sync();
 
 		if (!hasEdits) {
 			this.logService.info('Skipped storing working changes in the cloud as there are no edits to store.');
@@ -969,9 +989,9 @@ export class EditSessionsContribution extends Disposable implements IWorkbenchCo
 			: this.contextService.getWorkspace().folders.map((folder) => folder.name).join(', ');
 		quickPick.placeholder = localize('continueEditSessionPick.title.v2', "Select a development environment to continue working on {0} in", `'${workspaceContext}'`);
 		quickPick.items = this.createPickItems();
-		this.extensionService.onDidChangeExtensions(() => {
+		disposables.add(this.extensionService.onDidChangeExtensions(() => {
 			quickPick.items = this.createPickItems();
-		});
+		}));
 
 		const command = await new Promise<string | undefined>((resolve, reject) => {
 			disposables.add(quickPick.onDidHide(() => {
@@ -994,8 +1014,10 @@ export class EditSessionsContribution extends Disposable implements IWorkbenchCo
 
 			disposables.add(quickPick.onDidTriggerItemButton(async (e) => {
 				if (e.item.documentation !== undefined) {
-					const uri = URI.isUri(e.item.documentation) ? URI.parse(e.item.documentation) : await this.commandService.executeCommand(e.item.documentation);
-					void this.openerService.open(uri, { openExternal: true });
+					const uri = URI.isUri(e.item.documentation) ? URI.parse(e.item.documentation) : await this.commandService.executeCommand<URI>(e.item.documentation);
+					if (uri) {
+						void this.openerService.open(uri, { openExternal: true });
+					}
 				}
 			}));
 		});

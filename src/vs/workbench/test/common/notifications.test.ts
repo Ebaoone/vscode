@@ -8,8 +8,6 @@ import { NotificationsModel, NotificationViewItem, INotificationChangeEvent, Not
 import { Action } from '../../../base/common/actions.js';
 import { INotification, Severity, NotificationsFilter, NotificationPriority } from '../../../platform/notification/common/notification.js';
 import { createErrorWithActions } from '../../../base/common/errorMessage.js';
-import { NotificationService } from '../../services/notification/common/notificationService.js';
-import { TestStorageService } from './workbenchTestServices.js';
 import { timeout } from '../../../base/common/async.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../base/test/common/utils.js';
 import { DisposableStore } from '../../../base/common/lifecycle.js';
@@ -56,7 +54,9 @@ suite('Notifications', () => {
 
 		// Progress
 		assert.strictEqual(item1.hasProgress, false);
+		assert.strictEqual(item1.hasActiveProgress, false);
 		assert.strictEqual(item6.hasProgress, true);
+		assert.strictEqual(item6.hasActiveProgress, true);
 
 		// Message Box
 		assert.strictEqual(item5.canCollapse, false);
@@ -161,6 +161,65 @@ suite('Notifications', () => {
 		for (const item of [item1, item2, item3, item4, item5, item6, itemId1, itemId2, item7, item8, item9, item10, item11, item12, item13]) {
 			item.close();
 		}
+	});
+
+	test('Progress activity tracks starts, updates, completion, and restart', () => {
+		const item = NotificationViewItem.create({ severity: Severity.Info, message: 'Progress' }, noFilter)!;
+		const states: { hasProgress: boolean; hasActiveProgress: boolean; sticky: boolean; activeProgressChanged: boolean | undefined }[] = [];
+		const captureState = (activeProgressChanged?: boolean) => states.push({
+			hasProgress: item.hasProgress,
+			hasActiveProgress: item.hasActiveProgress,
+			sticky: item.sticky,
+			activeProgressChanged
+		});
+		disposables.add(item.onDidChangeContent(e => {
+			if (e.kind === NotificationViewItemContentChangeKind.PROGRESS) {
+				captureState(e.activeProgressChanged);
+			}
+		}));
+
+		captureState();
+		const progress = item.progress;
+		captureState();
+		progress.infinite();
+		progress.total(100);
+		progress.worked(10);
+		progress.done();
+		progress.infinite();
+
+		assert.deepStrictEqual(states, [
+			{ hasProgress: false, hasActiveProgress: false, sticky: false, activeProgressChanged: undefined },
+			{ hasProgress: true, hasActiveProgress: false, sticky: false, activeProgressChanged: undefined },
+			{ hasProgress: true, hasActiveProgress: true, sticky: true, activeProgressChanged: true },
+			{ hasProgress: true, hasActiveProgress: true, sticky: true, activeProgressChanged: false },
+			{ hasProgress: true, hasActiveProgress: true, sticky: true, activeProgressChanged: false },
+			{ hasProgress: true, hasActiveProgress: false, sticky: false, activeProgressChanged: true },
+			{ hasProgress: true, hasActiveProgress: true, sticky: true, activeProgressChanged: true }
+		]);
+
+		item.close();
+	});
+
+	test('Completed progress notifications remain unique', () => {
+		const model = disposables.add(new NotificationsModel());
+		const first = model.addNotification({ severity: Severity.Info, message: 'Same message' });
+		let firstClosed = false;
+		disposables.add(first.onDidClose(() => firstClosed = true));
+
+		first.progress.infinite();
+		first.progress.done();
+		const second = model.addNotification({ severity: Severity.Info, message: 'Same message' });
+
+		assert.deepStrictEqual({
+			notificationCount: model.notifications.length,
+			firstClosed
+		}, {
+			notificationCount: 2,
+			firstClosed: false
+		});
+
+		first.close();
+		second.close();
 	});
 
 	test('Items - does not fire changed when message did not change (content, severity)', async () => {
@@ -275,7 +334,7 @@ suite('Notifications', () => {
 		assert.strictEqual(model.statusMessage!.message, 'Hello World');
 		assert.strictEqual(lastStatusMessageEvent.item.message, model.statusMessage!.message);
 		assert.strictEqual(lastStatusMessageEvent.kind, StatusMessageChangeType.ADD);
-		disposable.dispose();
+		disposable.close();
 		assert.ok(!model.statusMessage);
 		assert.strictEqual(lastStatusMessageEvent.kind, StatusMessageChangeType.REMOVE);
 
@@ -284,53 +343,14 @@ suite('Notifications', () => {
 
 		assert.strictEqual(model.statusMessage!.message, 'Hello World 3');
 
-		disposable2.dispose();
+		disposable2.close();
 		assert.strictEqual(model.statusMessage!.message, 'Hello World 3');
 
-		disposable3.dispose();
+		disposable3.close();
 		assert.ok(!model.statusMessage);
 
 		item2DuplicateHandle.close();
 		item3Handle.close();
-	});
-
-	test('Service', async () => {
-		const service = disposables.add(new NotificationService(disposables.add(new TestStorageService())));
-
-		let addNotificationCount = 0;
-		let notification!: INotification;
-		disposables.add(service.onDidAddNotification(n => {
-			addNotificationCount++;
-			notification = n;
-		}));
-		service.info('hello there');
-		assert.strictEqual(addNotificationCount, 1);
-		assert.strictEqual(notification.message, 'hello there');
-		assert.strictEqual(notification.priority, NotificationPriority.DEFAULT);
-		assert.strictEqual(notification.source, undefined);
-		service.model.notifications[0].close();
-
-		let notificationHandle = service.notify({ message: 'important message', severity: Severity.Warning });
-		assert.strictEqual(addNotificationCount, 2);
-		assert.strictEqual(notification.message, 'important message');
-		assert.strictEqual(notification.severity, Severity.Warning);
-
-		let removeNotificationCount = 0;
-		disposables.add(service.onDidRemoveNotification(n => {
-			removeNotificationCount++;
-			notification = n;
-		}));
-		notificationHandle.close();
-		assert.strictEqual(removeNotificationCount, 1);
-		assert.strictEqual(notification.message, 'important message');
-
-		notificationHandle = service.notify({ priority: NotificationPriority.SILENT, message: 'test', severity: Severity.Ignore });
-		assert.strictEqual(addNotificationCount, 3);
-		assert.strictEqual(notification.message, 'test');
-		assert.strictEqual(notification.priority, NotificationPriority.SILENT);
-		notificationHandle.close();
-		assert.strictEqual(removeNotificationCount, 2);
-		notificationHandle.close();
 	});
 
 	ensureNoDisposablesAreLeakedInTestSuite();

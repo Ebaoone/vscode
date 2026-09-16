@@ -11,6 +11,10 @@ import { ViewContext } from '../../../common/viewModel/viewContext.js';
 import * as viewEvents from '../../../common/viewEvents.js';
 import { EditorOption, IRulerOption } from '../../../common/config/editorOptions.js';
 
+/**
+ * Rulers are vertical lines that appear at certain columns in the editor. There can be >= 0 rulers
+ * at a time.
+ */
 export class Rulers extends ViewPart {
 
 	public domNode: FastDomNode<HTMLElement>;
@@ -30,9 +34,6 @@ export class Rulers extends ViewPart {
 		this._typicalHalfwidthCharacterWidth = options.get(EditorOption.fontInfo).typicalHalfwidthCharacterWidth;
 	}
 
-	public override dispose(): void {
-		super.dispose();
-	}
 
 	// --- begin event handlers
 
@@ -62,13 +63,11 @@ export class Rulers extends ViewPart {
 		}
 
 		if (currentCount < desiredCount) {
-			const { tabSize } = this._context.viewModel.model.getOptions();
-			const rulerWidth = tabSize;
 			let addCount = desiredCount - currentCount;
 			while (addCount > 0) {
 				const node = createFastDomNode(document.createElement('div'));
 				node.setClassName('view-ruler');
-				node.setWidth(rulerWidth);
+				node.setWidth('1ch');
 				this.domNode.appendChild(node);
 				this._renderedRulers.push(node);
 				addCount--;

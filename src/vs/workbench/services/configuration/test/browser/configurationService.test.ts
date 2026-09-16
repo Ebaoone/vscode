@@ -8,8 +8,8 @@ import * as sinon from 'sinon';
 import { URI } from '../../../../../base/common/uri.js';
 import { Registry } from '../../../../../platform/registry/common/platform.js';
 import { IEnvironmentService } from '../../../../../platform/environment/common/environment.js';
-import { IConfigurationRegistry, Extensions as ConfigurationExtensions, ConfigurationScope, keyFromOverrideIdentifiers } from '../../../../../platform/configuration/common/configurationRegistry.js';
-import { WorkspaceService } from '../../browser/configurationService.js';
+import { IConfigurationDefaults, IConfigurationNode, IConfigurationRegistry, Extensions as ConfigurationExtensions, ConfigurationScope, keyFromOverrideIdentifiers } from '../../../../../platform/configuration/common/configurationRegistry.js';
+import { ConfigurationDefaultOverridesContribution, WorkspaceService } from '../../browser/configurationService.js';
 import { ConfigurationEditingErrorCode } from '../../common/configurationEditing.js';
 import { IFileService } from '../../../../../platform/files/common/files.js';
 import { IWorkspaceContextService, WorkbenchState, IWorkspaceFoldersChangeEvent, ISingleFolderWorkspaceIdentifier, IWorkspaceIdentifier } from '../../../../../platform/workspace/common/workspace.js';
@@ -35,7 +35,9 @@ import { IKeybindingEditingService, KeybindingsEditingService } from '../../../k
 import { IWorkbenchEnvironmentService } from '../../../environment/common/environmentService.js';
 import { timeout } from '../../../../../base/common/async.js';
 import { VSBuffer } from '../../../../../base/common/buffer.js';
-import { Event } from '../../../../../base/common/event.js';
+import { Emitter, Event } from '../../../../../base/common/event.js';
+import { IWorkbenchAssignmentService } from '../../../assignment/common/assignmentService.js';
+import { IExtensionService } from '../../../extensions/common/extensions.js';
 import { UriIdentityService } from '../../../../../platform/uriIdentity/common/uriIdentityService.js';
 import { InMemoryFileSystemProvider } from '../../../../../platform/files/common/inMemoryFilesystemProvider.js';
 import { BrowserWorkbenchEnvironmentService, IBrowserWorkbenchEnvironmentService } from '../../../environment/browser/environmentService.js';
@@ -52,6 +54,380 @@ import { IUserDataProfileService } from '../../../userDataProfile/common/userDat
 import { TasksSchemaProperties } from '../../../../contrib/tasks/common/tasks.js';
 import { RemoteSocketFactoryService } from '../../../../../platform/remote/common/remoteSocketFactoryService.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
+import { PolicyCategory } from '../../../../../base/common/policy.js';
+
+suite('ConfigurationDefaultOverridesContribution', () => {
+
+	ensureNoDisposablesAreLeakedInTestSuite();
+
+	const configurationRegistry = Registry.as<IConfigurationRegistry>(ConfigurationExtensions.Configuration);
+
+	type TestContribution = {
+		processedExperimentalSettings: Set<string>;
+		autoExperimentalSettings: Set<string>;
+		pendingStartupExperimentalSettings: Set<string>;
+		registeredExperimentalDefaults: Map<string, IConfigurationDefaults>;
+		configurationRegistry: IConfigurationRegistry;
+		workbenchAssignmentService: {
+			getTreatment<T extends string | number | boolean>(name: string): Promise<T | undefined>;
+		};
+		environmentService: { isSessionsWindow: boolean };
+		processExperimentalSettings(properties: Iterable<string>, autoRefetch: boolean): Promise<void>;
+	};
+
+	// Builds the contribution without running its constructor so that `processExperimentalSettings`
+	// can be driven directly, resolving treatments from the given (mutable) record.
+	function createTestContribution(treatments: Record<string, string | undefined>): TestContribution {
+		const contribution = Object.create(ConfigurationDefaultOverridesContribution.prototype) as TestContribution;
+		contribution.processedExperimentalSettings = new Set();
+		contribution.autoExperimentalSettings = new Set();
+		contribution.pendingStartupExperimentalSettings = new Set();
+		contribution.registeredExperimentalDefaults = new Map();
+		contribution.configurationRegistry = configurationRegistry;
+		contribution.workbenchAssignmentService = {
+			getTreatment: async <T extends string | number | boolean>(name: string) => treatments[name] as T | undefined,
+		};
+		contribution.environmentService = { isSessionsWindow: false };
+		return contribution;
+	}
+
+	const firstSetting = 'test.firstAutoExperimentalSetting';
+	const secondSetting = 'test.secondAutoExperimentalSetting';
+	const configuration: IConfigurationNode = {
+		id: 'test.autoExperimentalSettings',
+		type: 'object',
+		properties: {
+			[firstSetting]: {
+				type: 'string',
+				default: 'control',
+				experiment: {
+					mode: 'auto',
+					name: 'testFirstAutoExperimentalSetting'
+				}
+			},
+			[secondSetting]: {
+				type: 'string',
+				default: 'control',
+				experiment: {
+					mode: 'auto',
+					name: 'testSecondAutoExperimentalSetting'
+				}
+			}
+		}
+	};
+
+	test('replaces and removes auto-refetched overrides without changing other experiment defaults', async () => {
+		const treatments: Record<string, string | undefined> = {
+			testFirstAutoExperimentalSetting: 'firstTreatment',
+			testSecondAutoExperimentalSetting: 'secondTreatment',
+		};
+		const contribution = createTestContribution(treatments);
+		configurationRegistry.registerConfiguration(configuration);
+
+		try {
+			await contribution.processExperimentalSettings([firstSetting, secondSetting], false);
+			const initialDefaults = {
+				first: configurationRegistry.getConfigurationProperties()[firstSetting].default,
+				second: configurationRegistry.getConfigurationProperties()[secondSetting].default,
+			};
+
+			treatments.testFirstAutoExperimentalSetting = 'replacementTreatment';
+			await contribution.processExperimentalSettings([firstSetting], true);
+			const replacementDefaults = {
+				first: configurationRegistry.getConfigurationProperties()[firstSetting].default,
+				second: configurationRegistry.getConfigurationProperties()[secondSetting].default,
+			};
+
+			treatments.testFirstAutoExperimentalSetting = 'control';
+			await contribution.processExperimentalSettings([firstSetting], true);
+
+			assert.deepStrictEqual({
+				initialDefaults,
+				replacementDefaults,
+				controlDefaults: {
+					first: configurationRegistry.getConfigurationProperties()[firstSetting].default,
+					second: configurationRegistry.getConfigurationProperties()[secondSetting].default,
+				},
+			}, {
+				initialDefaults: {
+					first: 'firstTreatment',
+					second: 'secondTreatment',
+				},
+				replacementDefaults: {
+					first: 'replacementTreatment',
+					second: 'secondTreatment',
+				},
+				controlDefaults: {
+					first: 'control',
+					second: 'secondTreatment',
+				},
+			});
+		} finally {
+			if (contribution.registeredExperimentalDefaults.size) {
+				configurationRegistry.deregisterDefaultConfigurations([...contribution.registeredExperimentalDefaults.values()]);
+			}
+			configurationRegistry.deregisterConfigurations([configuration]);
+		}
+	});
+
+	test('keeps an auto experiment override when it resolves again to the same value', async () => {
+		const treatments: Record<string, string | undefined> = {
+			testFirstAutoExperimentalSetting: 'treatment',
+			testSecondAutoExperimentalSetting: undefined,
+		};
+		const contribution = createTestContribution(treatments);
+		configurationRegistry.registerConfiguration(configuration);
+
+		const readDefault = () => configurationRegistry.getConfigurationProperties()[firstSetting].default;
+
+		try {
+			await contribution.processExperimentalSettings([firstSetting], false);
+			const afterInitial = readDefault();
+
+			// A refetch that resolves to the same value must not drop the override.
+			await contribution.processExperimentalSettings([firstSetting], true);
+			const afterRefetch = readDefault();
+
+			// Leaving the experiment removes the override again.
+			treatments.testFirstAutoExperimentalSetting = undefined;
+			await contribution.processExperimentalSettings([firstSetting], true);
+
+			assert.deepStrictEqual({ afterInitial, afterRefetch, afterLeavingExperiment: readDefault() }, {
+				afterInitial: 'treatment',
+				afterRefetch: 'treatment',
+				afterLeavingExperiment: 'control',
+			});
+		} finally {
+			if (contribution.registeredExperimentalDefaults.size) {
+				configurationRegistry.deregisterDefaultConfigurations([...contribution.registeredExperimentalDefaults.values()]);
+			}
+			configurationRegistry.deregisterConfigurations([configuration]);
+		}
+	});
+
+	test('applies an auto experiment value that matches the schema default over another default override', async () => {
+		const overriddenSetting = 'test.overriddenAutoExperimentalSetting';
+		const overriddenConfiguration: IConfigurationNode = {
+			id: 'test.overriddenAutoExperimentalSettings',
+			type: 'object',
+			properties: {
+				[overriddenSetting]: {
+					type: 'string',
+					default: 'control',
+					experiment: {
+						mode: 'auto',
+						name: 'testOverriddenAutoExperimentalSetting'
+					}
+				}
+			}
+		};
+		// A competing default override that has not opted out of experiment overrides.
+		const otherDefaults: IConfigurationDefaults = { overrides: { [overriddenSetting]: 'otherDefault' }, source: 'otherDefaults' };
+		const treatments: Record<string, string | undefined> = {
+			testOverriddenAutoExperimentalSetting: 'control',
+		};
+		const contribution = createTestContribution(treatments);
+		configurationRegistry.registerConfiguration(overriddenConfiguration);
+		configurationRegistry.registerDefaultConfigurations([otherDefaults]);
+
+		const readDefault = () => configurationRegistry.getConfigurationProperties()[overriddenSetting].default;
+
+		try {
+			const beforeExperiment = readDefault();
+			await contribution.processExperimentalSettings([overriddenSetting], false);
+			const afterInitial = readDefault();
+
+			await contribution.processExperimentalSettings([overriddenSetting], true);
+
+			assert.deepStrictEqual({ beforeExperiment, afterInitial, afterRefetch: readDefault() }, {
+				beforeExperiment: 'otherDefault',
+				afterInitial: 'control',
+				afterRefetch: 'control',
+			});
+		} finally {
+			if (contribution.registeredExperimentalDefaults.size) {
+				configurationRegistry.deregisterDefaultConfigurations([...contribution.registeredExperimentalDefaults.values()]);
+			}
+			configurationRegistry.deregisterDefaultConfigurations([otherDefaults]);
+			configurationRegistry.deregisterConfigurations([overriddenConfiguration]);
+		}
+	});
+
+	test('defers a startup experiment until its value first resolves, then latches it', async () => {
+		const startupSetting = 'test.startupExperimentalSetting';
+		const startupConfiguration: IConfigurationNode = {
+			id: 'test.startupExperimentalSettings',
+			type: 'object',
+			properties: {
+				[startupSetting]: {
+					type: 'string',
+					default: 'control',
+					experiment: {
+						mode: 'startup',
+						name: 'testStartupExperimentalSetting'
+					}
+				}
+			}
+		};
+		// The treatment is unavailable during the initial resolution (as with a sign-in gated
+		// assignments endpoint) and only becomes available on a later refetch.
+		const treatments: Record<string, string | undefined> = {
+			testStartupExperimentalSetting: undefined,
+		};
+		const contribution = createTestContribution(treatments);
+		configurationRegistry.registerConfiguration(startupConfiguration);
+
+		const readDefault = () => configurationRegistry.getConfigurationProperties()[startupSetting].default;
+		// Mirror the refetch handler, which re-resolves only pending startup settings.
+		const refetch = () => contribution.processExperimentalSettings([...contribution.pendingStartupExperimentalSettings], true);
+
+		try {
+			// Initial resolution: no value yet, so the default is untouched and the setting is pending.
+			await contribution.processExperimentalSettings([startupSetting], false);
+			const afterInitial = { default: readDefault(), pending: contribution.pendingStartupExperimentalSettings.has(startupSetting) };
+
+			// The value becomes available; the next refetch resolves and latches it.
+			treatments.testStartupExperimentalSetting = 'treatment';
+			await refetch();
+			const afterResolved = { default: readDefault(), pending: contribution.pendingStartupExperimentalSettings.has(startupSetting) };
+
+			// A later assignment change must not move a latched startup value.
+			treatments.testStartupExperimentalSetting = 'changed';
+			await refetch();
+			const afterLatched = { default: readDefault(), pending: contribution.pendingStartupExperimentalSettings.has(startupSetting) };
+
+			assert.deepStrictEqual({ afterInitial, afterResolved, afterLatched }, {
+				afterInitial: { default: 'control', pending: true },
+				afterResolved: { default: 'treatment', pending: false },
+				afterLatched: { default: 'treatment', pending: false },
+			});
+		} finally {
+			if (contribution.registeredExperimentalDefaults.size) {
+				configurationRegistry.deregisterDefaultConfigurations([...contribution.registeredExperimentalDefaults.values()]);
+			}
+			configurationRegistry.deregisterConfigurations([startupConfiguration]);
+		}
+	});
+
+	test('does not re-resolve a startup experiment that already resolved at startup', async () => {
+		const startupSetting = 'test.resolvedStartupExperimentalSetting';
+		const startupConfiguration: IConfigurationNode = {
+			id: 'test.resolvedStartupExperimentalSettings',
+			type: 'object',
+			properties: {
+				[startupSetting]: {
+					type: 'string',
+					default: 'control',
+					experiment: {
+						mode: 'startup',
+						name: 'testResolvedStartupExperimentalSetting'
+					}
+				}
+			}
+		};
+		// The value is available during the initial resolution (as with the legacy endpoint, which
+		// resolves before sign-in).
+		const treatments: Record<string, string | undefined> = {
+			testResolvedStartupExperimentalSetting: 'treatment',
+		};
+		const contribution = createTestContribution(treatments);
+		configurationRegistry.registerConfiguration(startupConfiguration);
+
+		const readDefault = () => configurationRegistry.getConfigurationProperties()[startupSetting].default;
+		// Mirror the refetch handler, which re-resolves only pending startup settings.
+		const refetch = () => contribution.processExperimentalSettings([...contribution.pendingStartupExperimentalSettings], true);
+
+		try {
+			// Initial resolution captures the value and latches it (it is never pending).
+			await contribution.processExperimentalSettings([startupSetting], false);
+			const afterInitial = { default: readDefault(), pending: contribution.pendingStartupExperimentalSettings.has(startupSetting) };
+
+			// A later assignment change (e.g. after sign-in) must not move an already-resolved value.
+			treatments.testResolvedStartupExperimentalSetting = 'changed';
+			await refetch();
+			const afterRefetch = { default: readDefault(), pending: contribution.pendingStartupExperimentalSettings.has(startupSetting) };
+
+			assert.deepStrictEqual({ afterInitial, afterRefetch }, {
+				afterInitial: { default: 'treatment', pending: false },
+				afterRefetch: { default: 'treatment', pending: false },
+			});
+		} finally {
+			if (contribution.registeredExperimentalDefaults.size) {
+				configurationRegistry.deregisterDefaultConfigurations([...contribution.registeredExperimentalDefaults.values()]);
+			}
+			configurationRegistry.deregisterConfigurations([startupConfiguration]);
+		}
+	});
+
+	test('re-resolves pending startup settings when onDidRefetchAssignments fires', async () => {
+		const startupSetting = 'test.wiredStartupExperimentalSetting';
+		const startupConfiguration: IConfigurationNode = {
+			id: 'test.wiredStartupExperimentalSettings',
+			type: 'object',
+			properties: {
+				[startupSetting]: {
+					type: 'string',
+					default: 'control',
+					experiment: {
+						mode: 'startup',
+						name: 'testWiredStartupExperimentalSetting'
+					}
+				}
+			}
+		};
+		// No value at startup, so the setting stays pending until a value arrives on a refetch.
+		const treatments: Record<string, string | undefined> = {
+			testWiredStartupExperimentalSetting: undefined,
+		};
+		const onDidRefetchAssignments = new Emitter<void>();
+
+		// Construct the real contribution so the constructor's `onDidRefetchAssignments` -> refetch
+		// wiring is exercised end to end (rather than calling processExperimentalSettings directly).
+		const workbenchAssignmentService = {
+			onDidRefetchAssignments: onDidRefetchAssignments.event,
+			getTreatment: async (name: string) => treatments[name],
+		} as unknown as IWorkbenchAssignmentService;
+		const extensionService = { whenInstalledExtensionsRegistered: async () => true } as unknown as IExtensionService;
+		const workspaceService = { reloadConfiguration: async () => { } } as unknown as WorkspaceService;
+		const environmentService = { isSessionsWindow: false } as unknown as IWorkbenchEnvironmentService;
+
+		configurationRegistry.registerConfiguration(startupConfiguration);
+		const contribution = new ConfigurationDefaultOverridesContribution(workbenchAssignmentService, extensionService, workspaceService, environmentService, new NullLogService());
+		const internals = contribution as unknown as {
+			pendingStartupExperimentalSettings: Set<string>;
+			registeredExperimentalDefaults: Map<string, IConfigurationDefaults>;
+		};
+		const readDefault = () => configurationRegistry.getConfigurationProperties()[startupSetting].default;
+		const waitFor = async (predicate: () => boolean) => {
+			for (let i = 0; i < 100 && !predicate(); i++) {
+				await timeout(0);
+			}
+		};
+
+		try {
+			// The constructor's initial resolution finds no value, so the setting becomes pending.
+			await waitFor(() => internals.pendingStartupExperimentalSettings.has(startupSetting));
+			const afterInitial = { default: readDefault(), pending: internals.pendingStartupExperimentalSettings.has(startupSetting) };
+
+			// A value arrives; firing the event must re-resolve the pending setting through the wiring.
+			treatments.testWiredStartupExperimentalSetting = 'treatment';
+			onDidRefetchAssignments.fire();
+			await waitFor(() => readDefault() === 'treatment');
+
+			assert.deepStrictEqual({ afterInitial, afterRefetch: { default: readDefault(), pending: internals.pendingStartupExperimentalSettings.has(startupSetting) } }, {
+				afterInitial: { default: 'control', pending: true },
+				afterRefetch: { default: 'treatment', pending: false },
+			});
+		} finally {
+			contribution.dispose();
+			onDidRefetchAssignments.dispose();
+			if (internals.registeredExperimentalDefaults.size) {
+				configurationRegistry.deregisterDefaultConfigurations([...internals.registeredExperimentalDefaults.values()]);
+			}
+			configurationRegistry.deregisterConfigurations([startupConfiguration]);
+		}
+	});
+});
 
 function convertToWorkspacePayload(folder: URI): ISingleFolderWorkspaceIdentifier {
 	return {
@@ -751,6 +1127,11 @@ suite('WorkspaceConfigurationService - Folder', () => {
 					'default': 'isSet',
 					scope: ConfigurationScope.MACHINE
 				},
+				'configurationService.folder.applicationMachineSetting': {
+					'type': 'string',
+					'default': 'isSet',
+					scope: ConfigurationScope.APPLICATION_MACHINE
+				},
 				'configurationService.folder.machineOverridableSetting': {
 					'type': 'string',
 					'default': 'isSet',
@@ -776,7 +1157,19 @@ suite('WorkspaceConfigurationService - Folder', () => {
 					'default': 'isSet',
 					policy: {
 						name: 'configurationService.folder.policySetting',
+						category: PolicyCategory.Extensions,
 						minimumVersion: '1.0.0',
+						localization: { description: { key: '', value: '' } }
+					}
+				},
+				'configurationService.folder.policyObjectSetting': {
+					'type': 'object',
+					'default': {},
+					policy: {
+						name: 'configurationService.folder.policyObjectSetting',
+						category: PolicyCategory.Extensions,
+						minimumVersion: '1.0.0',
+						localization: { description: { key: '', value: '' } }
 					}
 				},
 			}
@@ -827,7 +1220,20 @@ suite('WorkspaceConfigurationService - Folder', () => {
 	});
 
 	test('defaults', () => {
-		assert.deepStrictEqual(testObject.getValue('configurationService'), { 'folder': { 'applicationSetting': 'isSet', 'machineSetting': 'isSet', 'machineOverridableSetting': 'isSet', 'testSetting': 'isSet', 'languageSetting': 'isSet', 'restrictedSetting': 'isSet', 'policySetting': 'isSet' } });
+		assert.deepStrictEqual(testObject.getValue('configurationService'),
+			{
+				'folder': {
+					'applicationSetting': 'isSet',
+					'machineSetting': 'isSet',
+					'applicationMachineSetting': 'isSet',
+					'machineOverridableSetting': 'isSet',
+					'testSetting': 'isSet',
+					'languageSetting': 'isSet',
+					'restrictedSetting': 'isSet',
+					'policySetting': 'isSet',
+					'policyObjectSetting': {}
+				}
+			});
 	});
 
 	test('globals override defaults', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
@@ -933,7 +1339,25 @@ suite('WorkspaceConfigurationService - Folder', () => {
 		assert.strictEqual(testObject.getValue('configurationService.folder.machineSetting', { resource: workspaceService.getWorkspace().folders[0].uri }), 'userValue');
 	}));
 
-	test('get application scope settings are not loaded after defaults are registered', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
+	test('application machine overridable settings are not read from workspace', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
+		await fileService.writeFile(userDataProfileService.currentProfile.settingsResource, VSBuffer.fromString('{ "configurationService.folder.applicationMachineSetting": "userValue" }'));
+		await fileService.writeFile(joinPath(workspaceService.getWorkspace().folders[0].uri, '.vscode', 'settings.json'), VSBuffer.fromString('{ "configurationService.folder.applicationMachineSetting": "workspaceValue" }'));
+
+		await testObject.reloadConfiguration();
+
+		assert.strictEqual(testObject.getValue('configurationService.folder.applicationMachineSetting'), 'userValue');
+	}));
+
+	test('application machine overridable settings are not read from workspace when workspace folder uri is passed', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
+		await fileService.writeFile(userDataProfileService.currentProfile.settingsResource, VSBuffer.fromString('{ "configurationService.folder.applicationMachineSetting": "userValue" }'));
+		await fileService.writeFile(joinPath(workspaceService.getWorkspace().folders[0].uri, '.vscode', 'settings.json'), VSBuffer.fromString('{ "configurationService.folder.applicationMachineSetting": "workspaceValue" }'));
+
+		await testObject.reloadConfiguration();
+
+		assert.strictEqual(testObject.getValue('configurationService.folder.applicationMachineSetting', { resource: workspaceService.getWorkspace().folders[0].uri }), 'userValue');
+	}));
+
+	test('get application scope settings are loaded after defaults are registered', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
 		await fileService.writeFile(userDataProfileService.currentProfile.settingsResource, VSBuffer.fromString('{ "configurationService.folder.applicationSetting-2": "userValue" }'));
 		await fileService.writeFile(joinPath(workspaceService.getWorkspace().folders[0].uri, '.vscode', 'settings.json'), VSBuffer.fromString('{ "configurationService.folder.applicationSetting-2": "workspaceValue" }'));
 
@@ -981,6 +1405,56 @@ suite('WorkspaceConfigurationService - Folder', () => {
 
 		await testObject.reloadConfiguration();
 		assert.strictEqual(testObject.getValue('configurationService.folder.applicationSetting-3', { resource: workspaceService.getWorkspace().folders[0].uri }), 'userValue');
+	}));
+
+	test('get application machine overridable scope settings are loaded after defaults are registered', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
+		await fileService.writeFile(userDataProfileService.currentProfile.settingsResource, VSBuffer.fromString('{ "configurationService.folder.applicationMachineSetting-2": "userValue" }'));
+		await fileService.writeFile(joinPath(workspaceService.getWorkspace().folders[0].uri, '.vscode', 'settings.json'), VSBuffer.fromString('{ "configurationService.folder.applicationMachineSetting-2": "workspaceValue" }'));
+
+		await testObject.reloadConfiguration();
+		assert.strictEqual(testObject.getValue('configurationService.folder.applicationMachineSetting-2'), 'workspaceValue');
+
+		configurationRegistry.registerConfiguration({
+			'id': '_test',
+			'type': 'object',
+			'properties': {
+				'configurationService.folder.applicationMachineSetting-2': {
+					'type': 'string',
+					'default': 'isSet',
+					scope: ConfigurationScope.APPLICATION
+				}
+			}
+		});
+
+		assert.strictEqual(testObject.getValue('configurationService.folder.applicationMachineSetting-2'), 'userValue');
+
+		await testObject.reloadConfiguration();
+		assert.strictEqual(testObject.getValue('configurationService.folder.applicationMachineSetting-2'), 'userValue');
+	}));
+
+	test('get application machine overridable scope settings are loaded after defaults are registered when workspace folder uri is passed', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
+		await fileService.writeFile(userDataProfileService.currentProfile.settingsResource, VSBuffer.fromString('{ "configurationService.folder.applicationMachineSetting-3": "userValue" }'));
+		await fileService.writeFile(joinPath(workspaceService.getWorkspace().folders[0].uri, '.vscode', 'settings.json'), VSBuffer.fromString('{ "configurationService.folder.applicationMachineSetting-3": "workspaceValue" }'));
+
+		await testObject.reloadConfiguration();
+		assert.strictEqual(testObject.getValue('configurationService.folder.applicationMachineSetting-3', { resource: workspaceService.getWorkspace().folders[0].uri }), 'workspaceValue');
+
+		configurationRegistry.registerConfiguration({
+			'id': '_test',
+			'type': 'object',
+			'properties': {
+				'configurationService.folder.applicationMachineSetting-3': {
+					'type': 'string',
+					'default': 'isSet',
+					scope: ConfigurationScope.APPLICATION
+				}
+			}
+		});
+
+		assert.strictEqual(testObject.getValue('configurationService.folder.applicationMachineSetting-3', { resource: workspaceService.getWorkspace().folders[0].uri }), 'userValue');
+
+		await testObject.reloadConfiguration();
+		assert.strictEqual(testObject.getValue('configurationService.folder.applicationMachineSetting-3', { resource: workspaceService.getWorkspace().folders[0].uri }), 'userValue');
 	}));
 
 	test('get machine scope settings are not loaded after defaults are registered', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
@@ -1050,6 +1524,19 @@ suite('WorkspaceConfigurationService - Folder', () => {
 		await testObject.reloadConfiguration();
 		assert.strictEqual(testObject.getValue('configurationService.folder.policySetting'), 'workspaceValue');
 		assert.strictEqual(testObject.inspect('configurationService.folder.policySetting').policyValue, undefined);
+	}));
+
+	test('policy value override all for object type setting', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
+		await runWithFakedTimers({ useFakeTimers: true }, async () => {
+			const promise = Event.toPromise(testObject.onDidChangeConfiguration);
+			await fileService.writeFile(environmentService.policyFile!, VSBuffer.fromString('{ "configurationService.folder.policyObjectSetting": {"a": true} }'));
+			return promise;
+		});
+
+		await fileService.writeFile(userDataProfileService.currentProfile.settingsResource, VSBuffer.fromString('{ "configurationService.folder.policyObjectSetting": {"b": true} }'));
+		await testObject.reloadConfiguration();
+
+		assert.deepStrictEqual(testObject.getValue('configurationService.folder.policyObjectSetting'), { a: true });
 	}));
 
 	test('reload configuration emits events after global configuraiton changes', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
@@ -1122,17 +1609,17 @@ suite('WorkspaceConfigurationService - Folder', () => {
 		assert.strictEqual(actual.application, undefined);
 		assert.deepStrictEqual(actual.userValue, {});
 		assert.deepStrictEqual(actual.workspaceValue, {
-			"configurationService": {
-				"tasks": {
-					"testSetting": "tasksValue"
+			'configurationService': {
+				'tasks': {
+					'testSetting': 'tasksValue'
 				}
 			}
 		});
 		assert.strictEqual(actual.workspaceFolderValue, undefined);
 		assert.deepStrictEqual(actual.value, {
-			"configurationService": {
-				"tasks": {
-					"testSetting": "tasksValue"
+			'configurationService': {
+				'tasks': {
+					'testSetting': 'tasksValue'
 				}
 			}
 		});
@@ -1178,17 +1665,17 @@ suite('WorkspaceConfigurationService - Folder', () => {
 		assert.strictEqual(actual.application, undefined);
 		assert.deepStrictEqual(actual.userValue, {});
 		assert.deepStrictEqual(actual.workspaceValue, {
-			"configurationService": {
-				"tasks": {
-					"testSetting": "tasksValue"
+			'configurationService': {
+				'tasks': {
+					'testSetting': 'tasksValue'
 				}
 			}
 		});
 		assert.strictEqual(actual.workspaceFolderValue, undefined);
 		assert.deepStrictEqual(actual.value, {
-			"configurationService": {
-				"tasks": {
-					"testSetting": "tasksValue"
+			'configurationService': {
+				'tasks': {
+					'testSetting': 'tasksValue'
 				}
 			}
 		});
@@ -1210,17 +1697,17 @@ suite('WorkspaceConfigurationService - Folder', () => {
 		assert.strictEqual(actual.application, undefined);
 		assert.deepStrictEqual(actual.userValue, {});
 		assert.deepStrictEqual(actual.workspaceValue, {
-			"configurationService": {
-				"tasks": {
-					"testSetting": "tasksValue"
+			'configurationService': {
+				'tasks': {
+					'testSetting': 'tasksValue'
 				}
 			}
 		});
 		assert.strictEqual(actual.workspaceFolderValue, undefined);
 		assert.deepStrictEqual(actual.value, {
-			"configurationService": {
-				"tasks": {
-					"testSetting": "tasksValue"
+			'configurationService': {
+				'tasks': {
+					'testSetting': 'tasksValue'
 				}
 			}
 		});
@@ -1330,6 +1817,11 @@ suite('WorkspaceConfigurationService - Folder', () => {
 
 	test('update application setting into workspace configuration in a workspace is not supported', () => {
 		return testObject.updateValue('configurationService.folder.applicationSetting', 'workspaceValue', {}, ConfigurationTarget.WORKSPACE, { donotNotifyError: true })
+			.then(() => assert.fail('Should not be supported'), (e) => assert.strictEqual(e.code, ConfigurationEditingErrorCode.ERROR_INVALID_WORKSPACE_CONFIGURATION_APPLICATION));
+	});
+
+	test('update application machine overridable setting into workspace configuration in a workspace is not supported', () => {
+		return testObject.updateValue('configurationService.folder.applicationMachineSetting', 'workspaceValue', {}, ConfigurationTarget.WORKSPACE, { donotNotifyError: true })
 			.then(() => assert.fail('Should not be supported'), (e) => assert.strictEqual(e.code, ConfigurationEditingErrorCode.ERROR_INVALID_WORKSPACE_CONFIGURATION_APPLICATION));
 	});
 
@@ -1587,6 +2079,11 @@ suite('WorkspaceConfigurationService - Profiles', () => {
 					'default': 'isSet',
 					scope: ConfigurationScope.APPLICATION
 				},
+				'configurationService.profiles.applicationMachineSetting': {
+					'type': 'string',
+					'default': 'isSet',
+					scope: ConfigurationScope.APPLICATION_MACHINE
+				},
 				'configurationService.profiles.testSetting': {
 					'type': 'string',
 					'default': 'isSet',
@@ -1693,6 +2190,13 @@ suite('WorkspaceConfigurationService - Profiles', () => {
 		assert.strictEqual(testObject.getValue('configurationService.profiles.applicationSetting'), 'applicationValue');
 	}));
 
+	test('update application machine setting', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
+		await testObject.updateValue('configurationService.profiles.applicationMachineSetting', 'applicationValue');
+
+		assert.deepStrictEqual(JSON.parse((await fileService.readFile(instantiationService.get(IUserDataProfilesService).defaultProfile.settingsResource)).value.toString()), { 'configurationService.profiles.applicationMachineSetting': 'applicationValue', 'configurationService.profiles.applicationSetting2': 'applicationValue', 'configurationService.profiles.testSetting2': 'userValue' });
+		assert.strictEqual(testObject.getValue('configurationService.profiles.applicationMachineSetting'), 'applicationValue');
+	}));
+
 	test('update normal setting', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
 		await testObject.updateValue('configurationService.profiles.testSetting', 'profileValue');
 
@@ -1735,6 +2239,12 @@ suite('WorkspaceConfigurationService - Profiles', () => {
 		});
 
 		assert.strictEqual(testObject.getValue('configurationService.profiles.applicationSetting3'), 'defaultProfile');
+	}));
+
+	test('non registering setting should not be read from default profile', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
+		await fileService.writeFile(instantiationService.get(IUserDataProfilesService).defaultProfile.settingsResource, VSBuffer.fromString('{ "configurationService.profiles.nonregistered": "defaultProfile" }'));
+		await testObject.reloadConfiguration();
+		assert.strictEqual(testObject.getValue('configurationService.profiles.nonregistered'), undefined);
 	}));
 
 	test('initialize with custom all profiles settings', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
@@ -2000,21 +2510,21 @@ suite('WorkspaceConfigurationService-Multiroot', () => {
 	});
 
 	test('application settings are not read from workspace', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
-		await fileService.writeFile(userDataProfileService.currentProfile.settingsResource, VSBuffer.fromString('{ "configurationService.folder.applicationSetting": "userValue" }'));
+		await fileService.writeFile(userDataProfileService.currentProfile.settingsResource, VSBuffer.fromString('{ "configurationService.workspace.applicationSetting": "userValue" }'));
 		await jsonEditingServce.write(workspaceContextService.getWorkspace().configuration!, [{ path: ['settings'], value: { 'configurationService.workspace.applicationSetting': 'workspaceValue' } }], true);
 
 		await testObject.reloadConfiguration();
 
-		assert.strictEqual(testObject.getValue('configurationService.folder.applicationSetting'), 'userValue');
+		assert.strictEqual(testObject.getValue('configurationService.workspace.applicationSetting'), 'userValue');
 	}));
 
 	test('application settings are not read from workspace when folder is passed', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
-		await fileService.writeFile(userDataProfileService.currentProfile.settingsResource, VSBuffer.fromString('{ "configurationService.folder.applicationSetting": "userValue" }'));
+		await fileService.writeFile(userDataProfileService.currentProfile.settingsResource, VSBuffer.fromString('{ "configurationService.workspace.applicationSetting": "userValue" }'));
 		await jsonEditingServce.write(workspaceContextService.getWorkspace().configuration!, [{ path: ['settings'], value: { 'configurationService.workspace.applicationSetting': 'workspaceValue' } }], true);
 
 		await testObject.reloadConfiguration();
 
-		assert.strictEqual(testObject.getValue('configurationService.folder.applicationSetting', { resource: workspaceContextService.getWorkspace().folders[0].uri }), 'userValue');
+		assert.strictEqual(testObject.getValue('configurationService.workspace.applicationSetting', { resource: workspaceContextService.getWorkspace().folders[0].uri }), 'userValue');
 	}));
 
 	test('machine settings are not read from workspace', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
@@ -2682,6 +3192,11 @@ suite('WorkspaceConfigurationService - Remote Folder', () => {
 					'default': 'isSet',
 					scope: ConfigurationScope.MACHINE
 				},
+				'configurationService.remote.applicationMachineSetting': {
+					'type': 'string',
+					'default': 'isSet',
+					scope: ConfigurationScope.APPLICATION_MACHINE
+				},
 				'configurationService.remote.machineOverridableSetting': {
 					'type': 'string',
 					'default': 'isSet',
@@ -2746,7 +3261,7 @@ suite('WorkspaceConfigurationService - Remote Folder', () => {
 		}));
 	}
 
-	test('remote settings override globals', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
+	test('remote machine settings override globals', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
 		await fileService.writeFile(machineSettingsResource, VSBuffer.fromString('{ "configurationService.remote.machineSetting": "remoteValue" }'));
 		registerRemoteFileSystemProvider();
 		resolveRemoteEnvironment();
@@ -2754,7 +3269,7 @@ suite('WorkspaceConfigurationService - Remote Folder', () => {
 		assert.strictEqual(testObject.getValue('configurationService.remote.machineSetting'), 'remoteValue');
 	}));
 
-	test('remote settings override globals after remote provider is registered on activation', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
+	test('remote machine settings override globals after remote provider is registered on activation', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
 		await fileService.writeFile(machineSettingsResource, VSBuffer.fromString('{ "configurationService.remote.machineSetting": "remoteValue" }'));
 		resolveRemoteEnvironment();
 		registerRemoteFileSystemProviderOnActivation();
@@ -2762,7 +3277,7 @@ suite('WorkspaceConfigurationService - Remote Folder', () => {
 		assert.strictEqual(testObject.getValue('configurationService.remote.machineSetting'), 'remoteValue');
 	}));
 
-	test('remote settings override globals after remote environment is resolved', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
+	test('remote machine settings override globals after remote environment is resolved', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
 		await fileService.writeFile(machineSettingsResource, VSBuffer.fromString('{ "configurationService.remote.machineSetting": "remoteValue" }'));
 		registerRemoteFileSystemProvider();
 		await initialize();
@@ -2810,6 +3325,70 @@ suite('WorkspaceConfigurationService - Remote Folder', () => {
 		assert.strictEqual(testObject.getValue('configurationService.remote.machineSetting'), 'isSet');
 	}));
 
+	test('remote application machine settings override globals', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
+		await fileService.writeFile(machineSettingsResource, VSBuffer.fromString('{ "configurationService.remote.applicationMachineSetting": "remoteValue" }'));
+		registerRemoteFileSystemProvider();
+		resolveRemoteEnvironment();
+		await initialize();
+		assert.strictEqual(testObject.getValue('configurationService.remote.applicationMachineSetting'), 'remoteValue');
+	}));
+
+	test('remote application machine settings override globals after remote provider is registered on activation', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
+		await fileService.writeFile(machineSettingsResource, VSBuffer.fromString('{ "configurationService.remote.applicationMachineSetting": "remoteValue" }'));
+		resolveRemoteEnvironment();
+		registerRemoteFileSystemProviderOnActivation();
+		await initialize();
+		assert.strictEqual(testObject.getValue('configurationService.remote.applicationMachineSetting'), 'remoteValue');
+	}));
+
+	test('remote application machine settings override globals after remote environment is resolved', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
+		await fileService.writeFile(machineSettingsResource, VSBuffer.fromString('{ "configurationService.remote.applicationMachineSetting": "remoteValue" }'));
+		registerRemoteFileSystemProvider();
+		await initialize();
+		const promise = new Promise<void>((c, e) => {
+			disposables.add(testObject.onDidChangeConfiguration(event => {
+				try {
+					assert.strictEqual(event.source, ConfigurationTarget.USER);
+					assert.deepStrictEqual([...event.affectedKeys], ['configurationService.remote.applicationMachineSetting']);
+					assert.strictEqual(testObject.getValue('configurationService.remote.applicationMachineSetting'), 'remoteValue');
+					c();
+				} catch (error) {
+					e(error);
+				}
+			}));
+		});
+		resolveRemoteEnvironment();
+		return promise;
+	}));
+
+	test('remote application machine settings override globals after remote provider is registered on activation and remote environment is resolved', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
+		await fileService.writeFile(machineSettingsResource, VSBuffer.fromString('{ "configurationService.remote.applicationMachineSetting": "remoteValue" }'));
+		registerRemoteFileSystemProviderOnActivation();
+		await initialize();
+		const promise = new Promise<void>((c, e) => {
+			disposables.add(testObject.onDidChangeConfiguration(event => {
+				try {
+					assert.strictEqual(event.source, ConfigurationTarget.USER);
+					assert.deepStrictEqual([...event.affectedKeys], ['configurationService.remote.applicationMachineSetting']);
+					assert.strictEqual(testObject.getValue('configurationService.remote.applicationMachineSetting'), 'remoteValue');
+					c();
+				} catch (error) {
+					e(error);
+				}
+			}));
+		});
+		resolveRemoteEnvironment();
+		return promise;
+	}));
+
+	test('application machine settings in local user settings does not override defaults', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
+		await fileService.writeFile(userDataProfileService.currentProfile.settingsResource, VSBuffer.fromString('{ "configurationService.remote.applicationMachineSetting": "globalValue" }'));
+		registerRemoteFileSystemProvider();
+		resolveRemoteEnvironment();
+		await initialize();
+		assert.strictEqual(testObject.getValue('configurationService.remote.applicationMachineSetting'), 'isSet');
+	}));
+
 	test('machine overridable settings in local user settings does not override defaults', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
 		await fileService.writeFile(userDataProfileService.currentProfile.settingsResource, VSBuffer.fromString('{ "configurationService.remote.machineOverridableSetting": "globalValue" }'));
 		registerRemoteFileSystemProvider();
@@ -2834,6 +3413,16 @@ suite('WorkspaceConfigurationService - Remote Folder', () => {
 		await testObject.updateValue('configurationService.remote.machineSetting', 'machineValue');
 		await testObject.reloadConfiguration();
 		assert.strictEqual(testObject.inspect('configurationService.remote.machineSetting').userRemoteValue, 'machineValue');
+	}));
+
+	test('application machine setting is written in remote settings', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {
+		registerRemoteFileSystemProvider();
+		resolveRemoteEnvironment();
+		await initialize();
+		await testObject.updateValue('configurationService.remote.applicationMachineSetting', 'machineValue');
+		await testObject.reloadConfiguration();
+		const actual = testObject.inspect('configurationService.remote.applicationMachineSetting');
+		assert.strictEqual(actual.userRemoteValue, 'machineValue');
 	}));
 
 	test('machine overridable setting is written in remote settings', () => runWithFakedTimers<void>({ useFakeTimers: true }, async () => {

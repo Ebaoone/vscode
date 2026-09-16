@@ -20,6 +20,13 @@ export class NoEditorTabsControl extends EditorTabsControl {
 		};
 	}
 
+	protected override prepareEditorLayoutActions(): IToolbarActions {
+		return {
+			primary: [],
+			secondary: []
+		};
+	}
+
 	openEditor(editor: EditorInput): boolean {
 		return this.handleOpenedEditors();
 	}
@@ -47,9 +54,17 @@ export class NoEditorTabsControl extends EditorTabsControl {
 
 	beforeCloseEditor(editor: EditorInput): void { }
 
-	closeEditor(editor: EditorInput): void { }
+	closeEditor(editor: EditorInput): void {
+		this.handleClosedEditors();
+	}
 
-	closeEditors(editors: EditorInput[]): void { }
+	closeEditors(editors: EditorInput[]): void {
+		this.handleClosedEditors();
+	}
+
+	private handleClosedEditors(): void {
+		this.activeEditor = this.tabsModel.activeEditor;
+	}
 
 	moveEditor(editor: EditorInput, fromIndex: number, targetIndex: number): void { }
 
@@ -64,6 +79,8 @@ export class NoEditorTabsControl extends EditorTabsControl {
 	updateEditorSelections(): void { }
 
 	updateEditorLabel(editor: EditorInput): void { }
+
+	updateEditorCapabilities(editor: EditorInput): void { }
 
 	updateEditorDirty(editor: EditorInput): void { }
 

@@ -40,18 +40,17 @@ export class Search extends Viewlet {
 	}
 
 	async openSearchViewlet(): Promise<any> {
+		const accept = () => this.waitForInputFocus(INPUT);
 		if (process.platform === 'darwin') {
-			await this.code.dispatchKeybinding('cmd+shift+f');
+			await this.code.dispatchKeybinding('cmd+shift+f', accept);
 		} else {
-			await this.code.dispatchKeybinding('ctrl+shift+f');
+			await this.code.dispatchKeybinding('ctrl+shift+f', accept);
 		}
-
-		await this.waitForInputFocus(INPUT);
 	}
 
 	async getSearchTooltip(): Promise<any> {
-		const icon = await this.code.waitForElement(`.activitybar .action-label.codicon.codicon-search-view-icon`, (el) => !!el?.attributes?.['title']);
-		return icon.attributes['title'];
+		const icon = await this.code.waitForElement(`.activitybar .action-label.codicon.codicon-search-view-icon`, (el) => !!el?.attributes?.title);
+		return icon.attributes.title;
 	}
 
 	async searchFor(text: string): Promise<void> {
@@ -69,18 +68,16 @@ export class Search extends Viewlet {
 	}
 
 	async waitForPageUp(): Promise<void> {
-		await this.code.dispatchKeybinding('PageUp');
+		await this.code.dispatchKeybinding('PageUp', async () => { });
 	}
 
 	async waitForPageDown(): Promise<void> {
-		await this.code.dispatchKeybinding('PageDown');
+		await this.code.dispatchKeybinding('PageDown', async () => { });
 	}
 
 	async submitSearch(): Promise<void> {
 		await this.waitForInputFocus(INPUT);
-
-		await this.code.dispatchKeybinding('enter');
-		await this.code.waitForElement(`${VIEWLET} .messages`);
+		await this.code.dispatchKeybinding('enter', async () => { await this.code.waitForElement(`${VIEWLET} .messages`); });
 	}
 
 	async setFilesToIncludeText(text: string): Promise<void> {

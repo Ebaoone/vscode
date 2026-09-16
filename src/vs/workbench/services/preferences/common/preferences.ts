@@ -3,7 +3,6 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { IStringDictionary } from '../../../../base/common/collections.js';
 import { Event } from '../../../../base/common/event.js';
 import { IMatch } from '../../../../base/common/filters.js';
 import { IJSONSchema, IJSONSchemaMap } from '../../../../base/common/jsonSchema.js';
@@ -38,7 +37,8 @@ export enum SettingValueType {
 	Object = 'object',
 	BooleanObject = 'boolean-object',
 	LanguageTag = 'language-tag',
-	ExtensionToggle = 'extension-toggle'
+	ExtensionToggle = 'extension-toggle',
+	ComplexObject = 'complex-object',
 }
 
 export interface ISettingsGroup {
@@ -52,7 +52,6 @@ export interface ISettingsGroup {
 }
 
 export interface ISettingsSection {
-	titleRange?: IRange;
 	title?: string;
 	settings: ISetting[];
 }
@@ -64,12 +63,14 @@ export interface ISetting {
 	value: any;
 	valueRange: IRange;
 	description: string[];
+	keywords?: string[];
 	descriptionIsMarkdown?: boolean;
 	descriptionRanges: IRange[];
 	overrides?: ISetting[];
 	overrideOf?: ISetting;
 	deprecationMessage?: string;
 	deprecationMessageIsMarkdown?: boolean;
+	deprecationMessageSeverity?: 'warning' | 'info';
 
 	scope?: ConfigurationScope;
 	type?: string | string[];
@@ -78,6 +79,7 @@ export interface ISetting {
 	objectProperties?: IJSONSchemaMap;
 	objectPatternProperties?: IJSONSchemaMap;
 	objectAdditionalProperties?: boolean | IJSONSchema;
+	propertyNames?: IJSONSchema;
 	enum?: string[];
 	enumDescriptions?: string[];
 	enumDescriptionsAreMarkdown?: boolean;
@@ -108,8 +110,7 @@ export interface IExtensionSetting extends ISetting {
 
 export interface ISearchResult {
 	filterMatches: ISettingMatch[];
-	exactMatch?: boolean;
-	metadata?: IFilterMetadata;
+	exactMatch: boolean;
 }
 
 export interface ISearchResultGroup {
@@ -124,7 +125,6 @@ export interface IFilterResult {
 	filteredGroups: ISettingsGroup[];
 	allGroups: ISettingsGroup[];
 	matches: IRange[];
-	metadata?: IStringDictionary<IFilterMetadata>;
 	exactMatch?: boolean;
 }
 
@@ -136,44 +136,27 @@ export enum SettingMatchType {
 	None = 0,
 	LanguageTagSettingMatch = 1 << 0,
 	RemoteMatch = 1 << 1,
-	DescriptionOrValueMatch = 1 << 2,
-	KeyMatch = 1 << 3
+	NonContiguousQueryInSettingId = 1 << 2,
+	DescriptionOrValueMatch = 1 << 3,
+	NonContiguousWordsInSettingsLabel = 1 << 4,
+	ContiguousWordsInSettingsLabel = 1 << 5,
+	ContiguousQueryInSettingId = 1 << 6,
+	AllWordsInSettingsLabel = 1 << 7,
+	ExactMatch = 1 << 8,
 }
+export const SettingKeyMatchTypes = (SettingMatchType.AllWordsInSettingsLabel
+	| SettingMatchType.ContiguousWordsInSettingsLabel
+	| SettingMatchType.NonContiguousWordsInSettingsLabel
+	| SettingMatchType.NonContiguousQueryInSettingId
+	| SettingMatchType.ContiguousQueryInSettingId);
 
 export interface ISettingMatch {
 	setting: ISetting;
 	matches: IRange[] | null;
 	matchType: SettingMatchType;
+	keyMatchScore: number;
 	score: number;
-}
-
-export interface IScoredResults {
-	[key: string]: IRemoteSetting;
-}
-
-export interface IRemoteSetting {
-	score: number;
-	key: string;
-	id: string;
-	defaultValue: string;
-	description: string;
-	packageId: string;
-	extensionName?: string;
-	extensionPublisher?: string;
-}
-
-export interface IFilterMetadata {
-	requestUrl: string;
-	requestBody: string;
-	timestamp: number;
-	duration: number;
-	scoredResults: IScoredResults;
-
-	/** The number of requests made, since requests are split by number of filters */
-	requestCount?: number;
-
-	/** The name of the server that actually served the request */
-	context: string;
+	providerName?: string;
 }
 
 export interface IPreferencesEditorModel<T> {
@@ -183,13 +166,12 @@ export interface IPreferencesEditorModel<T> {
 }
 
 export type IGroupFilter = (group: ISettingsGroup) => boolean | null;
-export type ISettingMatcher = (setting: ISetting, group: ISettingsGroup) => { matches: IRange[]; matchType: SettingMatchType; score: number } | null;
+export type ISettingMatcher = (setting: ISetting, group: ISettingsGroup) => { matches: IRange[]; matchType: SettingMatchType; keyMatchScore: number; score: number } | null;
 
 export interface ISettingsEditorModel extends IPreferencesEditorModel<ISetting> {
 	readonly onDidChangeGroups: Event<void>;
 	settingsGroups: ISettingsGroup[];
 	filterSettings(filter: string, groupFilter: IGroupFilter, settingMatcher: ISettingMatcher): ISettingMatch[];
-	findValueMatches(filter: string, setting: ISetting): IRange[];
 	updateResultGroup(id: string, resultGroup: ISearchResultGroup | undefined): IFilterResult | undefined;
 }
 
@@ -210,6 +192,7 @@ export interface ISettingsEditorOptions extends IEditorOptions {
 export interface IOpenSettingsOptions extends ISettingsEditorOptions {
 	jsonEditor?: boolean;
 	openToSide?: boolean;
+	groupId?: number;
 }
 
 export function validateSettingsEditorOptions(options: ISettingsEditorOptions): ISettingsEditorOptions {
@@ -230,6 +213,10 @@ export interface IKeybindingsEditorOptions extends IEditorOptions {
 	query?: string;
 }
 
+export interface IOpenKeybindingsEditorOptions extends IKeybindingsEditorOptions {
+	groupId?: number;
+}
+
 export const IPreferencesService = createDecorator<IPreferencesService>('preferencesService');
 
 export interface IPreferencesService {
@@ -246,6 +233,8 @@ export interface IPreferencesService {
 	hasDefaultSettingsContent(uri: URI): boolean;
 	createSettings2EditorModel(): Settings2EditorModel; // TODO
 
+	openPreferences(): Promise<void>;
+
 	openRawDefaultSettings(): Promise<IEditorPane | undefined>;
 	openSettings(options?: IOpenSettingsOptions): Promise<IEditorPane | undefined>;
 	openApplicationSettings(options?: IOpenSettingsOptions): Promise<IEditorPane | undefined>;
@@ -253,7 +242,7 @@ export interface IPreferencesService {
 	openRemoteSettings(options?: IOpenSettingsOptions): Promise<IEditorPane | undefined>;
 	openWorkspaceSettings(options?: IOpenSettingsOptions): Promise<IEditorPane | undefined>;
 	openFolderSettings(options: IOpenSettingsOptions & { folderUri: IOpenSettingsOptions['folderUri'] }): Promise<IEditorPane | undefined>;
-	openGlobalKeybindingSettings(textual: boolean, options?: IKeybindingsEditorOptions): Promise<void>;
+	openGlobalKeybindingSettings(textual: boolean, options?: IOpenKeybindingsEditorOptions): Promise<void>;
 	openDefaultKeybindingsFile(): Promise<IEditorPane | undefined>;
 	openLanguageSpecificSettings(languageId: string, options?: IOpenSettingsOptions): Promise<IEditorPane | undefined>;
 	getEditableSettingsURI(configurationTarget: ConfigurationTarget, resource?: URI): Promise<URI | null>;
@@ -330,5 +319,6 @@ export interface IDefineKeybindingEditorContribution extends IEditorContribution
 export const FOLDER_SETTINGS_PATH = '.vscode/settings.json';
 export const DEFAULT_SETTINGS_EDITOR_SETTING = 'workbench.settings.openDefaultSettings';
 export const USE_SPLIT_JSON_SETTING = 'workbench.settings.useSplitJSON';
+export const ALWAYS_SHOW_ADVANCED_SETTINGS_SETTING = 'workbench.settings.alwaysShowAdvancedSettings';
 
 export const SETTINGS_AUTHORITY = 'settings';

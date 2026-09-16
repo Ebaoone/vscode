@@ -12,6 +12,7 @@ import { Disposable, DisposableStore } from '../../../../base/common/lifecycle.j
 import { IActiveCodeEditor, ICodeEditor, IDiffEditor } from '../../../../editor/browser/editorBrowser.js';
 import { EditorAction, EditorContributionInstantiation, ServicesAccessor, registerDiffEditorContribution, registerEditorAction, registerEditorContribution } from '../../../../editor/browser/editorExtensions.js';
 import { ICodeEditorService } from '../../../../editor/browser/services/codeEditorService.js';
+import { findDiffEditorContainingCodeEditor } from '../../../../editor/browser/widget/diffEditor/commands.js';
 import { EditorOption } from '../../../../editor/common/config/editorOptions.js';
 import { IDiffEditorContribution, IEditorContribution } from '../../../../editor/common/editorCommon.js';
 import { EditorContextKeys } from '../../../../editor/common/editorContextKeys.js';
@@ -19,6 +20,7 @@ import { ITextModel } from '../../../../editor/common/model.js';
 import * as nls from '../../../../nls.js';
 import { MenuId, MenuRegistry } from '../../../../platform/actions/common/actions.js';
 import { ContextKeyExpr, IContextKey, IContextKeyService, RawContextKey } from '../../../../platform/contextkey/common/contextkey.js';
+import { IInstantiationService } from '../../../../platform/instantiation/common/instantiation.js';
 import { KeybindingWeight } from '../../../../platform/keybinding/common/keybindingsRegistry.js';
 import { IWorkbenchContribution, WorkbenchPhase, registerWorkbenchContribution2 } from '../../../common/contributions.js';
 import { IEditorService } from '../../../services/editor/common/editorService.js';
@@ -27,7 +29,7 @@ const transientWordWrapState = 'transientWordWrapState';
 const isWordWrapMinifiedKey = 'isWordWrapMinified';
 const isDominatedByLongLinesKey = 'isDominatedByLongLines';
 const CAN_TOGGLE_WORD_WRAP = new RawContextKey<boolean>('canToggleWordWrap', false, true);
-const EDITOR_WORD_WRAP = new RawContextKey<boolean>('editorWordWrap', false, nls.localize('editorWordWrap', 'Whether the editor is currently using word wrapping.'));
+export const EDITOR_WORD_WRAP = new RawContextKey<boolean>('editorWordWrap', false, nls.localize('editorWordWrap', 'Whether the editor is currently using word wrapping.'));
 
 /**
  * State written/read by the toggle word wrap action and associated with a particular model.
@@ -47,7 +49,7 @@ export function writeTransientState(model: ITextModel, state: IWordWrapTransient
  * Read (in memory) the word wrap state for a particular model.
  */
 export function readTransientState(model: ITextModel, codeEditorService: ICodeEditorService): IWordWrapTransientState | null {
-	return codeEditorService.getTransientModelProperty(model, transientWordWrapState);
+	return codeEditorService.getTransientModelProperty(model, transientWordWrapState) as IWordWrapTransientState | null;
 }
 
 const TOGGLE_WORD_WRAP_ID = 'editor.action.toggleWordWrap';
@@ -56,8 +58,7 @@ class ToggleWordWrapAction extends EditorAction {
 	constructor() {
 		super({
 			id: TOGGLE_WORD_WRAP_ID,
-			label: nls.localize('toggle.wordwrap', "View: Toggle Word Wrap"),
-			alias: 'View: Toggle Word Wrap',
+			label: nls.localize2('toggle.wordwrap', "View: Toggle Word Wrap"),
 			precondition: undefined,
 			kbOpts: {
 				kbExpr: null,
@@ -69,6 +70,7 @@ class ToggleWordWrapAction extends EditorAction {
 
 	public run(accessor: ServicesAccessor, editor: ICodeEditor): void {
 		const codeEditorService = accessor.get(ICodeEditorService);
+		const instaService = accessor.get(IInstantiationService);
 
 		if (!canToggleWordWrap(codeEditorService, editor)) {
 			return;
@@ -94,7 +96,7 @@ class ToggleWordWrapAction extends EditorAction {
 		writeTransientState(model, newState, codeEditorService);
 
 		// if we are in a diff editor, update the other editor (if possible)
-		const diffEditor = findDiffEditorContainingCodeEditor(editor, codeEditorService);
+		const diffEditor = instaService.invokeFunction(findDiffEditorContainingCodeEditor, editor);
 		if (diffEditor) {
 			const originalEditor = diffEditor.getOriginalEditor();
 			const modifiedEditor = diffEditor.getModifiedEditor();
@@ -105,24 +107,6 @@ class ToggleWordWrapAction extends EditorAction {
 			}
 		}
 	}
-}
-
-/**
- * If `editor` is the original or modified editor of a diff editor, it returns it.
- * It returns null otherwise.
- */
-function findDiffEditorContainingCodeEditor(editor: ICodeEditor, codeEditorService: ICodeEditorService): IDiffEditor | null {
-	if (!editor.getOption(EditorOption.inDiffEditor)) {
-		return null;
-	}
-	for (const diffEditor of codeEditorService.listDiffEditors()) {
-		const originalEditor = diffEditor.getOriginalEditor();
-		const modifiedEditor = diffEditor.getModifiedEditor();
-		if (originalEditor === editor || modifiedEditor === editor) {
-			return diffEditor;
-		}
-	}
-	return null;
 }
 
 class ToggleWordWrapController extends Disposable implements IEditorContribution {
@@ -260,6 +244,7 @@ class EditorWordWrapContextKeyTracker extends Disposable implements IWorkbenchCo
 	private readonly _editorWordWrap: IContextKey<boolean>;
 	private _activeEditor: ICodeEditor | null;
 	private readonly _activeEditorListener: DisposableStore;
+	private readonly _activeEditorPaneListener: DisposableStore;
 
 	constructor(
 		@IEditorService private readonly _editorService: IEditorService,
@@ -271,11 +256,21 @@ class EditorWordWrapContextKeyTracker extends Disposable implements IWorkbenchCo
 			disposables.add(addDisposableListener(window, 'focus', () => this._update(), true));
 			disposables.add(addDisposableListener(window, 'blur', () => this._update(), true));
 		}, { window: mainWindow, disposables: this._store }));
-		this._register(this._editorService.onDidActiveEditorChange(() => this._update()));
 		this._canToggleWordWrap = CAN_TOGGLE_WORD_WRAP.bindTo(this._contextService);
 		this._editorWordWrap = EDITOR_WORD_WRAP.bindTo(this._contextService);
 		this._activeEditor = null;
-		this._activeEditorListener = new DisposableStore();
+		this._activeEditorListener = this._register(new DisposableStore());
+		this._activeEditorPaneListener = this._register(new DisposableStore());
+		this._register(this._editorService.onDidActiveEditorChange(() => this._updateActiveEditorPane()));
+		this._updateActiveEditorPane();
+	}
+
+	private _updateActiveEditorPane(): void {
+		this._activeEditorPaneListener.clear();
+		const activeEditorPane = this._editorService.activeEditorPane;
+		if (activeEditorPane) {
+			this._activeEditorPaneListener.add(activeEditorPane.onDidChangeControl(() => this._update()));
+		}
 		this._update();
 	}
 
@@ -296,6 +291,8 @@ class EditorWordWrapContextKeyTracker extends Disposable implements IWorkbenchCo
 				}
 			}));
 			this._updateFromCodeEditor();
+		} else {
+			this._setValues(false, false);
 		}
 	}
 
@@ -358,5 +355,5 @@ MenuRegistry.appendMenuItem(MenuId.MenubarViewMenu, {
 		precondition: CAN_TOGGLE_WORD_WRAP
 	},
 	order: 1,
-	group: '5_editor'
+	group: '6_editor'
 });

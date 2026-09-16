@@ -4,13 +4,12 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { distinct } from '../../../../base/common/arrays.js';
-import { findLastIdx } from '../../../../base/common/arraysFind.js';
 import { DeferredPromise, RunOnceScheduler } from '../../../../base/common/async.js';
 import { VSBuffer, decodeBase64, encodeBase64 } from '../../../../base/common/buffer.js';
 import { CancellationTokenSource } from '../../../../base/common/cancellation.js';
-import { Emitter, Event } from '../../../../base/common/event.js';
+import { Emitter, Event, trackSetChanges } from '../../../../base/common/event.js';
 import { stringHash } from '../../../../base/common/hash.js';
-import { Disposable, DisposableMap, IDisposable } from '../../../../base/common/lifecycle.js';
+import { Disposable } from '../../../../base/common/lifecycle.js';
 import { mixin } from '../../../../base/common/objects.js';
 import { autorun } from '../../../../base/common/observable.js';
 import * as resources from '../../../../base/common/resources.js';
@@ -234,6 +233,7 @@ export class ExpressionContainer implements IExpressionContainer {
 		} catch (e) {
 			this.value = e.message || '';
 			this.reference = 0;
+			this.memoryReference = undefined;
 			return false;
 		}
 	}
@@ -246,7 +246,8 @@ function handleSetResponse(expression: ExpressionContainer, response: DebugProto
 		expression.reference = response.body.variablesReference;
 		expression.namedVariables = response.body.namedVariables;
 		expression.indexedVariables = response.body.indexedVariables;
-		// todo @weinand: the set responses contain most properties, but not memory references. Should they?
+		expression.memoryReference = response.body.memoryReference;
+		expression.valueLocationReference = response.body.valueLocationReference;
 	}
 }
 
@@ -258,7 +259,7 @@ export class VisualizedExpression implements IExpression {
 		return Promise.resolve();
 	}
 	getChildren(): Promise<IExpression[]> {
-		return this.visualizer.getVisualizedChildren(this.treeId, this.treeItem.id);
+		return this.visualizer.getVisualizedChildren(this.session, this.treeId, this.treeItem.id);
 	}
 
 	getId(): string {
@@ -278,11 +279,16 @@ export class VisualizedExpression implements IExpression {
 	}
 
 	constructor(
+		private readonly session: IDebugSession | undefined,
 		private readonly visualizer: IDebugVisualizerService,
 		public readonly treeId: string,
 		public readonly treeItem: IDebugVisualizationTreeItem,
 		public readonly original?: Variable,
 	) { }
+
+	public getSession(): IDebugSession | undefined {
+		return this.session;
+	}
 
 	/** Edits the value, sets the {@link errorMessage} and returns false if unsuccessful */
 	public async edit(newValue: string) {
@@ -324,6 +330,24 @@ export class Expression extends ExpressionContainer implements IExpression {
 
 	override toString(): string {
 		return `${this.name}\n${this.value}`;
+	}
+
+	toJSON() {
+		return {
+			sessionId: this.getSession()?.getId(),
+			variable: this.toDebugProtocolObject(),
+		};
+	}
+
+	toDebugProtocolObject(): DebugProtocol.Variable {
+		return {
+			name: this.name,
+			variablesReference: this.reference || 0,
+			memoryReference: this.memoryReference,
+			value: this.value,
+			type: this.type,
+			evaluateName: this.name
+		};
 	}
 
 	async setExpression(value: string, stackFrame: IStackFrame): Promise<void> {
@@ -370,7 +394,7 @@ export class Variable extends ExpressionContainer implements IExpression {
 		return this.threadId;
 	}
 
-	async setVariable(value: string, stackFrame: IStackFrame): Promise<any> {
+	async setVariable(value: string, stackFrame: IStackFrame): Promise<void> {
 		if (!this.session) {
 			return;
 		}
@@ -401,6 +425,16 @@ export class Variable extends ExpressionContainer implements IExpression {
 		return this.name ? `${this.name}: ${this.value}` : this.value;
 	}
 
+	toJSON() {
+		return {
+			sessionId: this.getSession()?.getId(),
+			container: this.parent instanceof Expression
+				? { expression: this.parent.name }
+				: (this.parent as (Variable | Scope)).toDebugProtocolObject(),
+			variable: this.toDebugProtocolObject()
+		};
+	}
+
 	protected override adoptLazyResponse(response: DebugProtocol.Variable): void {
 		this.evaluateName = response.evaluateName;
 	}
@@ -411,6 +445,7 @@ export class Variable extends ExpressionContainer implements IExpression {
 			variablesReference: this.reference || 0,
 			memoryReference: this.memoryReference,
 			value: this.value,
+			type: this.type,
 			evaluateName: this.evaluateName
 		};
 	}
@@ -429,6 +464,10 @@ export class Scope extends ExpressionContainer implements IScope {
 		public readonly range?: IRange
 	) {
 		super(stackFrame.thread.session, stackFrame.thread.threadId, reference, `scope:${name}:${id}`, namedVariables, indexedVariables);
+	}
+
+	get childrenHaveBeenLoaded(): boolean {
+		return !!this.children;
 	}
 
 	override toString(): string {
@@ -537,10 +576,10 @@ export class StackFrame implements IStackFrame {
 	async openInEditor(editorService: IEditorService, preserveFocus?: boolean, sideBySide?: boolean, pinned?: boolean): Promise<IEditorPane | undefined> {
 		const threadStopReason = this.thread.stoppedDetails?.reason;
 		if (this.instructionPointerReference &&
-			(threadStopReason === 'instruction breakpoint' ||
-				(threadStopReason === 'step' && this.thread.lastSteppingGranularity === 'instruction') ||
+			((threadStopReason === 'instruction breakpoint' && !preserveFocus) ||
+				(threadStopReason === 'step' && this.thread.lastSteppingGranularity === 'instruction' && !preserveFocus) ||
 				editorService.activeEditor instanceof DisassemblyViewInput)) {
-			return editorService.openEditor(DisassemblyViewInput.instance, { pinned: true, revealIfOpened: true });
+			return editorService.openEditor(DisassemblyViewInput.instance, { pinned: true, revealIfOpened: true, preserveFocus });
 		}
 
 		if (this.source.available) {
@@ -682,35 +721,35 @@ export class Thread implements IThread {
 		return Promise.resolve(undefined);
 	}
 
-	next(granularity?: DebugProtocol.SteppingGranularity): Promise<any> {
+	next(granularity?: DebugProtocol.SteppingGranularity): Promise<void> {
 		return this.session.next(this.threadId, granularity);
 	}
 
-	stepIn(granularity?: DebugProtocol.SteppingGranularity): Promise<any> {
+	stepIn(granularity?: DebugProtocol.SteppingGranularity): Promise<void> {
 		return this.session.stepIn(this.threadId, undefined, granularity);
 	}
 
-	stepOut(granularity?: DebugProtocol.SteppingGranularity): Promise<any> {
+	stepOut(granularity?: DebugProtocol.SteppingGranularity): Promise<void> {
 		return this.session.stepOut(this.threadId, granularity);
 	}
 
-	stepBack(granularity?: DebugProtocol.SteppingGranularity): Promise<any> {
+	stepBack(granularity?: DebugProtocol.SteppingGranularity): Promise<void> {
 		return this.session.stepBack(this.threadId, granularity);
 	}
 
-	continue(): Promise<any> {
+	continue(): Promise<void> {
 		return this.session.continue(this.threadId);
 	}
 
-	pause(): Promise<any> {
+	pause(): Promise<void> {
 		return this.session.pause(this.threadId);
 	}
 
-	terminate(): Promise<any> {
+	terminate(): Promise<void> {
 		return this.session.terminateThreads([this.threadId]);
 	}
 
-	reverseContinue(): Promise<any> {
+	reverseContinue(): Promise<void> {
 		return this.session.reverseContinue(this.threadId);
 	}
 }
@@ -739,10 +778,11 @@ export class MemoryRegion extends Disposable implements IMemoryRegion {
 	public readonly onDidInvalidate = this.invalidateEmitter.event;
 
 	/** @inheritdoc */
-	public readonly writable = !!this.session.capabilities.supportsWriteMemoryRequest;
+	public readonly writable: boolean;
 
 	constructor(private readonly memoryReference: string, private readonly session: IDebugSession) {
 		super();
+		this.writable = !!this.session.capabilities.supportsWriteMemoryRequest;
 		this._register(session.onDidInvalidateMemory(e => {
 			if (e.body.memoryReference === memoryReference) {
 				this.invalidate(e.body.offset, e.body.count - e.body.offset);
@@ -951,14 +991,14 @@ export interface IBreakpointOptions extends IBaseBreakpointOptions {
 	uri: uri;
 	lineNumber: number;
 	column: number | undefined;
-	adapterData: any;
+	adapterData: unknown;
 	triggeredBy: string | undefined;
 }
 
 export class Breakpoint extends BaseBreakpoint implements IBreakpoint {
 	private sessionsDidTrigger?: Set<string>;
 	private readonly _uri: uri;
-	private _adapterData: any;
+	private _adapterData: unknown;
 	private _lineNumber: number;
 	private _column: number | undefined;
 	public triggeredBy: string | undefined;
@@ -1028,7 +1068,7 @@ export class Breakpoint extends BaseBreakpoint implements IBreakpoint {
 		return super.message;
 	}
 
-	get adapterData(): any {
+	get adapterData(): unknown {
 		return this.data && this.data.source && this.data.source.adapterData ? this.data.source.adapterData : this._adapterData;
 	}
 
@@ -1086,9 +1126,13 @@ export class Breakpoint extends BaseBreakpoint implements IBreakpoint {
 		return `${resources.basenameOrAuthority(this.uri)} ${this.lineNumber}`;
 	}
 
-	public setSessionDidTrigger(sessionId: string): void {
-		this.sessionsDidTrigger ??= new Set();
-		this.sessionsDidTrigger.add(sessionId);
+	public setSessionDidTrigger(sessionId: string, didTrigger = true): void {
+		if (didTrigger) {
+			this.sessionsDidTrigger ??= new Set();
+			this.sessionsDidTrigger.add(sessionId);
+		} else {
+			this.sessionsDidTrigger?.delete(sessionId);
+		}
 	}
 
 	public getSessionDidTrigger(sessionId: string): boolean {
@@ -1414,6 +1458,9 @@ export class DebugModel extends Disposable implements IDebugModel {
 	private breakpointsActivated = true;
 	private readonly _onDidChangeBreakpoints = this._register(new Emitter<IBreakpointsChangeEvent | undefined>());
 	private readonly _onDidChangeCallStack = this._register(new Emitter<void>());
+	private _onDidChangeCallStackFire = this._register(new RunOnceScheduler(() => {
+		this._onDidChangeCallStack.fire(undefined);
+	}, 100));
 	private readonly _onDidChangeWatchExpressions = this._register(new Emitter<IExpression | undefined>());
 	private readonly _onDidChangeWatchExpressionValue = this._register(new Emitter<IExpression | undefined>());
 	private readonly _breakpointModes = new Map<string, IBreakpointModeInternal>();
@@ -1422,7 +1469,6 @@ export class DebugModel extends Disposable implements IDebugModel {
 	private exceptionBreakpoints!: ExceptionBreakpoint[];
 	private dataBreakpoints!: DataBreakpoint[];
 	private watchExpressions!: Expression[];
-	private watchExpressionChangeListeners: DisposableMap<string, IDisposable> = this._register(new DisposableMap());
 	private instructionBreakpoints: InstructionBreakpoint[];
 
 	constructor(
@@ -1446,12 +1492,14 @@ export class DebugModel extends Disposable implements IDebugModel {
 			this._onDidChangeWatchExpressions.fire(undefined);
 		}));
 
+		this._register(trackSetChanges(
+			() => new Set(this.watchExpressions),
+			this.onDidChangeWatchExpressions,
+			(we) => we.onDidChangeValue((e) => this._onDidChangeWatchExpressionValue.fire(e)))
+		);
+
 		this.instructionBreakpoints = [];
 		this.sessions = [];
-
-		for (const we of this.watchExpressions) {
-			this.watchExpressionChangeListeners.set(we.getId(), we.onDidChangeValue((e) => this._onDidChangeWatchExpressionValue.fire(e)));
-		}
 	}
 
 	getId(): string {
@@ -1471,14 +1519,32 @@ export class DebugModel extends Disposable implements IDebugModel {
 		return this.sessions.filter(s => includeInactive || s.state !== State.Inactive);
 	}
 
+	private shouldDisposeSession(session: IDebugSession, newSession: IDebugSession): boolean {
+		if (session.state !== State.Inactive) {
+			return false;
+		}
+		if (session.configuration.name === newSession.configuration.name) {
+			return true;
+		}
+		if (newSession.parentSession) {
+			return false;
+		}
+		let rootSession = session;
+		while (rootSession.parentSession) {
+			rootSession = rootSession.parentSession;
+		}
+		return rootSession.state === State.Inactive && rootSession.configuration.name === newSession.configuration.name;
+	}
+
 	addSession(session: IDebugSession): void {
 		this.sessions = this.sessions.filter(s => {
 			if (s.getId() === session.getId()) {
 				// Make sure to de-dupe if a session is re-initialized. In case of EH debugging we are adding a session again after an attach.
 				return false;
 			}
-			if (s.state === State.Inactive && s.configuration.name === session.configuration.name) {
+			if (this.shouldDisposeSession(s, session)) {
 				// Make sure to remove all inactive sessions that are using the same configuration as the new session
+				s.dispose();
 				return false;
 			}
 
@@ -1493,7 +1559,7 @@ export class DebugModel extends Disposable implements IDebugModel {
 		let index = -1;
 		if (session.parentSession) {
 			// Make sure that child sessions are placed after the parent session
-			index = findLastIdx(this.sessions, s => s.parentSession === session.parentSession || s === session.parentSession);
+			index = this.sessions.findLastIndex(s => s.parentSession === session.parentSession || s === session.parentSession);
 		}
 		if (index >= 0) {
 			this.sessions.splice(index + 1, 0, session);
@@ -1529,15 +1595,28 @@ export class DebugModel extends Disposable implements IDebugModel {
 
 	clearThreads(id: string, removeThreads: boolean, reference: number | undefined = undefined): void {
 		const session = this.sessions.find(p => p.getId() === id);
-		this.schedulers.forEach(entry => {
-			entry.scheduler.dispose();
-			entry.completeDeferred.complete();
-		});
-		this.schedulers.clear();
-
 		if (session) {
+			let threads: IThread[];
+			if (reference === undefined) {
+				threads = session.getAllThreads();
+			} else {
+				const thread = session.getThread(reference);
+				threads = thread !== undefined ? [thread] : [];
+			}
+			for (const thread of threads) {
+				const threadId = thread.getId();
+				const entry = this.schedulers.get(threadId);
+				if (entry !== undefined) {
+					entry.scheduler.dispose();
+					entry.completeDeferred.complete();
+					this.schedulers.delete(threadId);
+				}
+			}
+
 			session.clearThreads(removeThreads, reference);
-			this._onDidChangeCallStack.fire(undefined);
+			if (!this._onDidChangeCallStackFire.isScheduled()) {
+				this._onDidChangeCallStackFire.schedule();
+			}
 		}
 	}
 
@@ -2002,9 +2081,23 @@ export class DebugModel extends Disposable implements IDebugModel {
 		this._onDidChangeBreakpoints.fire({ added: [newInstructionBreakpoint], sessionOnly: true });
 	}
 
-	removeInstructionBreakpoints(instructionReference?: string, offset?: number): void {
+	removeInstructionBreakpoints(instructionReference?: string, offset?: number, address?: bigint): void {
 		let removed: InstructionBreakpoint[] = [];
-		if (instructionReference) {
+		if (address !== undefined) {
+			// Prefer matching by resolved memory address: `instructionReference` is
+			// allowed by the Debug Adapter Protocol to change between disassemble
+			// requests (e.g. after symbol reloads), so matching on reference+offset
+			// alone would fail to locate the breakpoint that the user is trying to
+			// toggle off. The `address` on an `InstructionBreakpoint` is the stable
+			// resolved memory address and uniquely identifies it.
+			for (let i = 0; i < this.instructionBreakpoints.length; i++) {
+				const ibp = this.instructionBreakpoints[i];
+				if (ibp.address === address) {
+					removed.push(ibp);
+					this.instructionBreakpoints.splice(i--, 1);
+				}
+			}
+		} else if (instructionReference) {
 			for (let i = 0; i < this.instructionBreakpoints.length; i++) {
 				const ibp = this.instructionBreakpoints[i];
 				if (ibp.instructionReference === instructionReference && (offset === undefined || ibp.offset === offset)) {
@@ -2025,7 +2118,6 @@ export class DebugModel extends Disposable implements IDebugModel {
 
 	addWatchExpression(name?: string): IExpression {
 		const we = new Expression(name || '');
-		this.watchExpressionChangeListeners.set(we.getId(), we.onDidChangeValue((e) => this._onDidChangeWatchExpressionValue.fire(e)));
 		this.watchExpressions.push(we);
 		this._onDidChangeWatchExpressions.fire(we);
 
@@ -2043,11 +2135,6 @@ export class DebugModel extends Disposable implements IDebugModel {
 	removeWatchExpressions(id: string | null = null): void {
 		this.watchExpressions = id ? this.watchExpressions.filter(we => we.getId() !== id) : [];
 		this._onDidChangeWatchExpressions.fire(undefined);
-		if (!id) {
-			this.watchExpressionChangeListeners.clearAndDisposeAll();
-			return;
-		}
-		this.watchExpressionChangeListeners.deleteAndDispose(id);
 	}
 
 	moveWatchExpression(id: string, position: number): void {
